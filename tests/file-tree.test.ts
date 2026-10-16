@@ -25,10 +25,12 @@ const utf8 = (s: string) => {
   return n
 }
 
-type World = { tree: Tree; reads: string[]; runs: string[][]; lists: number; root: string }
+type World = { tree: Tree; reads: string[]; runs: string[][]; lists: number; root: string; pngs: Set<string> }
+const TMP = '/tmp/file-tree-test'
+const PNG1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
 
 const install = (on: On, tree: Tree, opts: { entries?: FsEntry[] } = {}): World => {
-  const w: World = { tree, reads: [], runs: [], lists: 0, root: '' }
+  const w: World = { tree, reads: [], runs: [], lists: 0, root: '', pngs: new Set() }
   // The engine hands hooks absolute paths under the session cwd; the first listing is the root.
   const rel = (p: string) => (p === w.root ? '' : p.startsWith(w.root + '/') ? p.slice(w.root.length + 1) : p)
   const step = (at: Node | undefined, name: string): Node | undefined =>
@@ -83,6 +85,8 @@ const install = (on: On, tree: Tree, opts: { entries?: FsEntry[] } = {}): World 
     return { value: { kind: entryKind(to.node), size: sizeOf(to.node), mtimeMs: 1, isLink, ...(realPath ? { realPath } : {}) } }
   })
   on('fs.read', async (_$, e) => {
+    // The PNG sips wrote into the mktemp folder (see process.run); a real 1x1 PNG stands in for it.
+    if (e.path.startsWith(`${TMP}/`)) return w.pngs.has(e.path) ? { value: { base64: PNG1 } } : { deny: 'ENOENT' }
     const path = rel(e.path)
     w.reads.push(path)
     const at = find(path, true)
@@ -103,6 +107,16 @@ const install = (on: On, tree: Tree, opts: { entries?: FsEntry[] } = {}): World 
       const img = find(rel(argv[argv.length - 1] ?? ''), true)
       if (img && img.node.kind === 'file' && img.node.px) return out(0, `/x\n  pixelWidth: ${img.node.px.w}\n  pixelHeight: ${img.node.px.h}\n`)
     }
+    if (argv[0] === 'mktemp' && argv[1] === '-d') return out(0, `${TMP}\n`)
+    // sips -s format png -Z <edge> <path> --out <out>: writes a PNG where the file has a `px`.
+    if (argv[0] === 'sips' && argv[1] === '-s') {
+      const img = find(rel(argv[6] ?? ''), true)
+      if (img && img.node.kind === 'file' && img.node.px) {
+        w.pngs.add(argv[8] ?? '')
+        return out(0)
+      }
+    }
+    if (argv[0] === 'rm') return out(0)
     return out(1)
   })
   return w
@@ -1000,5 +1014,108 @@ describe('e2e', () => {
     expect(w.runs.some(r => r[0] === 'cmd')).toBe(false)
     // Every launcher gets the name as a path, never as an option.
     expect(w.runs.filter(r => r[0] === 'open' || r[0] === 'xdg-open').every(r => !r[r.length - 1]?.startsWith('-'))).toBe(true)
+  })
+})
+
+// Re-audit of the fix commit. The first test is coverage for the image Box (it passes); each other one names a bug still there.
+describe('re-audit', () => {
+  const LINES = (n: number, p = 'line ') => Array.from({ length: n }, (_, i) => `${p}${i}`).join('\n')
+  // Cells a box line may take: the border and paddingX={1} take two on each side.
+  const boxWidths = (top: El, cols: number) => {
+    const box = (top.children ?? []).filter(isEl).find(k => k.props?.borderStyle === 'round')
+    if (!box) return [] as string[]
+    const inner = cols - 4
+    const bad: string[] = []
+    for (const el of all(box)) {
+      if (el.type === 'Button') {
+        for (const l of String(el.props?.label ?? textOf(el)).split('\n')) if (width(l) + 4 > inner) bad.push(`button ${JSON.stringify(l)}`)
+      } else if (el.type === 'Box' && el.props?.flexDirection === 'row') {
+        const w = (el.children ?? []).filter(isEl).reduce((n, k) => n + width(textOf(k)) + (k.type === 'Button' ? 4 : 0), 0)
+        if (w > inner) bad.push(`footer ${w} cells`)
+      }
+    }
+    return bad
+  }
+
+  test('an image preview mounts on terminal and desktop with the body bodyRows + 1 tall', async ($, on) => {
+    install(on, { 'a.txt': file(), 'pic.png': file('png', { px: { w: 800, h: 600 } }) })
+    for (const surface of SURFACES) {
+      // In a short pane the path rows come before the picture and can leave it no room, on purpose.
+      for (const rows of [20, 40]) {
+        const { ui, read } = await open($, 56, rows, surface)
+        await ui.press({ key: K('pic.png') })
+        const v = await read()
+        // Only the terminal has an Image element; the desktop box keeps the headline, path and buttons.
+        expect(all(v.top).some(e => e.type === 'Image'), `${surface} ${rows}: image drawn`).toBe(surface === 'terminal')
+        expect(height(v.top), `${surface} bodyRows ${rows}`).toBe(rows + 1)
+        await ui.press({ key: 'close-preview' })
+        await ui.unmount()
+      }
+    }
+  })
+
+  // Heights all hold; what fails is width: under 28 columns "[ Show in file manager ]" (24 cells) and under 16 the
+  // footer wrap past the box's inner width, adding rows the layout never counted.
+  test('the body is bodyRows + 1 tall and every box line fits, at bodyRows 4..40 and narrow columns', { timeoutMs: 120000 }, async ($, on) => {
+    // Twelve files make the hint "n/12 …"; the mp4's real path is long (the test root), as a real project's is.
+    const tree: Tree = { 'long.txt': file(LINES(300)), 'clip.mp4': file('x'), 'pic.png': file('png', { px: { w: 400, h: 300 } }) }
+    for (let i = 0; i < 9; i++) tree[`f${i}.txt`] = file()
+    install(on, tree)
+    const bad: string[] = []
+    for (const cols of [8, 10, 14, 20, 24, 28, 40, 56]) {
+      const { ui, read } = await open($, cols, 4)
+      for (const pick of ['', 'long.txt', 'clip.mp4', 'pic.png']) {
+        // Pressed in a tall pane, where every row is drawn.
+        await ui.redraw(props(cols, 400))
+        if (pick) await ui.press({ key: K(pick) })
+        for (let rows = 4; rows <= 40; rows++) {
+          await ui.redraw(props(cols, rows))
+          const v = await read()
+          const h = height(v.top)
+          if (h !== rows + 1) bad.push(`${pick || 'none'} ${cols}x${rows}: height ${h}`)
+          for (const b of boxWidths(v.top, cols)) bad.push(`${pick || 'none'} ${cols}x${rows}: ${b}`)
+        }
+        if (pick) await ui.press({ key: 'close-preview' })
+      }
+      await ui.unmount()
+    }
+    // Grouped so the failure reads as a short list of ranges.
+    const groups = new Map<string, number[]>()
+    for (const b of bad) {
+      const m = b.match(/^(\S+) (\d+)x(\d+): (.*?)(?: \d+| "[^"]*")?$/)
+      const k = m ? `${m[1]} cols ${m[2]}: ${m[4]}` : b
+      groups.set(k, [...(groups.get(k) ?? []), m ? Number(m[3]) : 0])
+    }
+    const summary = [...groups].map(([k, r]) => `${k} @ bodyRows ${Math.min(...r)}..${Math.max(...r)} (${r.length})`)
+    expect(summary).toEqual([])
+  })
+
+  test('two surfaces with the same bodyRows but different widths each route the wheel by their own box', async ($, on) => {
+    // Five 90-character lines wrap to 15 rows at 40 columns and stay 5 at 100, so the two boxes start on different rows.
+    install(on, { 'a.txt': file(), 'wide.txt': file(LINES(5, 'w'.repeat(88))), 'z.txt': file() })
+    const rows = 20
+    const narrow = await open($, 40, rows, 'terminal')
+    await narrow.ui.press({ key: K('wide.txt') })
+    await narrow.read()
+    const wide = await open($, 100, rows, 'desktop')
+    const before = await wide.read()
+    const kids = (before.top.children ?? []).filter(isEl)
+    const boxRow = height(kids[0]) + height(kids[1])
+    // On the 100-column surface this row is a tree row, two above its box; the 40-column surface's box starts higher.
+    await scroll($, 1, rows, boxRow - 2)
+    const after = await wide.read()
+    expect(after.cursor, 'the wheel over a tree row walks the cursor').toBe('z.txt')
+  })
+
+  test('a cursor inside a deleted folder lands near that folder, not on the first row', async ($, on) => {
+    const w = install(on, { a: dir(), b: dir(), d: dir({ 'x.txt': file() }), m: dir(), 'z.txt': file() })
+    const { ui, read } = await open($)
+    await ui.press({ key: K('d') })
+    await ui.press({ key: K('d/x.txt') })
+    expect((await read()).cursor).toBe('d/x.txt')
+    remove(w, 'd')
+    await ui.redraw()
+    // Its parent is the root, which is no row, so the fallback ends at order[0] ('a') three rows away.
+    expect((await read()).cursor).toBe('m')
   })
 })
