@@ -1,0 +1,6 @@
+{
+  "name": "file-tree",
+  "version": "0.1.0",
+  "description": "A project file tree pane inside Claude Code, the same in every terminal.",
+  "types": "./types/index.d.ts"
+}
