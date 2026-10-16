@@ -5,13 +5,13 @@ import type { FsEntry, On } from 'claude-code'
 // The kit has no mock for fs or process; the test's own hooks on 'fs.*' and 'process.run'
 // sit beneath the plugin and answer for the engine, so this file models a small disk.
 type Node =
-  | { kind: 'file'; text: string; size?: number; deny?: string }
+  | { kind: 'file'; text: string; size?: number; deny?: string; px?: { w: number; h: number } }
   | { kind: 'dir'; children: Tree }
   | { kind: 'link'; to: string }
   | { kind: 'fifo' }
 type Tree = Record<string, Node>
 
-const file = (text = '', extra: { size?: number; deny?: string } = {}): Node => ({ kind: 'file', text, ...extra })
+const file = (text = '', extra: { size?: number; deny?: string; px?: { w: number; h: number } } = {}): Node => ({ kind: 'file', text, ...extra })
 const dir = (children: Tree = {}): Node => ({ kind: 'dir', children })
 const link = (to: string): Node => ({ kind: 'link', to })
 const fifo = (): Node => ({ kind: 'fifo' })
@@ -98,6 +98,11 @@ const install = (on: On, tree: Tree, opts: { entries?: FsEntry[] } = {}): World 
     const out = (exitCode: number, stdout = '') =>
       ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }) as const
     if (at && at.node.kind === 'file') return out(0, at.node.text.slice(0, Number(argv[2])))
+    // sips -g pixelWidth -g pixelHeight <path>: answers a file's `px`, as sips reads an image's header.
+    if (argv[0] === 'sips' && argv[1] === '-g') {
+      const img = find(rel(argv[argv.length - 1] ?? ''), true)
+      if (img && img.node.kind === 'file' && img.node.px) return out(0, `/x\n  pixelWidth: ${img.node.px.w}\n  pixelHeight: ${img.node.px.h}\n`)
+    }
     return out(1)
   })
   return w
@@ -114,6 +119,33 @@ const remove = (w: World, path: string) => {
     at = n.children
   }
   delete at[last]
+}
+
+// Puts a node at a path, as a write, a rename or a replace on disk would.
+const put = (w: World, path: string, node: Node) => {
+  const parts = path.split('/')
+  const last = parts.pop() ?? ''
+  let at: Tree = w.tree
+  for (const p of parts) {
+    const n = at[p]
+    if (!n || n.kind !== 'dir') return
+    at = n.children
+  }
+  at[last] = node
+}
+
+// Rows an element takes as the plugin lays it out (it pre-wraps every line): a column Box stacks, a border adds two.
+const height = (x: unknown): number => {
+  if (!isEl(x)) return 0
+  const kids = (x.children ?? []).filter(isEl)
+  if (x.type === 'Box') {
+    const inner = x.props?.flexDirection === 'row' ? Math.max(0, ...kids.map(height)) : kids.reduce((n, k) => n + height(k), 0)
+    return inner + (x.props?.borderStyle ? 2 : 0)
+  }
+  if (x.type === 'Code') return String(x.props?.source ?? '').split('\n').length
+  if (x.type === 'Image') return Number(x.props?.rows ?? 0)
+  if (x.type === 'Button') return String(x.props?.label ?? textOf(x)).split('\n').length
+  return textOf(x).split('\n').length
 }
 
 // Wide cells as a terminal draws them (East Asian Wide/Fullwidth and emoji presentation).
@@ -786,5 +818,137 @@ describe('hooks', () => {
     expect(passed).toBe(1)
     await scroll($, 1, 20)
     expect(passed).toBe(1)
+  })
+})
+
+// Failing tests from the audit: each names a bug in hooks/register.tsx. They fail on the code as it stands.
+describe('audit', () => {
+  const LINES = (n: number) => Array.from({ length: n }, (_, i) => `line ${i}`).join('\n')
+
+  test('sanity: with no preview and with a text preview the body is bodyRows + 1 tall', async ($, on) => {
+    install(on, { 'a.txt': file(), 'long.txt': file(LINES(200)) })
+    const rows = 20
+    const { ui, read } = await open($, 40, rows)
+    expect(height((await read()).top)).toBe(rows + 1)
+    await ui.press({ key: K('long.txt') })
+    expect(height((await read()).top)).toBe(rows + 1)
+  })
+
+  test('an image edited on disk shows its new size (sizes/pngs are keyed by path only)', async ($, on) => {
+    const w = install(on, { 'chart.png': file('v1', { px: { w: 300, h: 200 } }) })
+    const { ui, read } = await open($, 40, 20)
+    await ui.press({ key: K('chart.png') })
+    expect((await read()).boxText).toContain('300 × 200 px')
+    // A tool rewrites the chart; tool.call bumps tick and the pane redraws.
+    put(w, 'chart.png', file('version two', { px: { w: 600, h: 400 } }))
+    await ui.redraw()
+    expect((await read()).boxText).toContain('600 × 400 px')
+  })
+
+  test('an image whose first sips call failed is measured again once it can be', async ($, on) => {
+    // Selected while still being written: sips fails, and null is cached for the path for the life of the module.
+    const w = install(on, { 'shot.png': file('partial') })
+    const { ui, read } = await open($, 40, 20)
+    await ui.press({ key: K('shot.png') })
+    expect((await read()).boxText).toContain('size unknown')
+    put(w, 'shot.png', file('complete png', { px: { w: 64, h: 32 } }))
+    await ui.redraw()
+    expect((await read()).boxText).toContain('64 × 32 px')
+  })
+
+  test('an opaque preview (mp4) keeps the body bodyRows + 1 tall, as the arrow keys need', async ($, on) => {
+    install(on, { 'a.txt': file(), 'clip.mp4': file('x') })
+    for (const rows of [20, 30]) {
+      const { ui, read } = await open($, 60, rows)
+      await ui.press({ key: K('clip.mp4') })
+      expect(height((await read()).top), `bodyRows ${rows}`).toBe(rows + 1)
+      await ui.unmount()
+    }
+  })
+
+  test('an opaque preview with a long real path fits a short pane (Open/Show buttons stay on screen)', async ($, on) => {
+    install(on, { 'a.txt': file(), 'clip.mp4': file('x') })
+    const rows = 12
+    const { ui, read } = await open($, 40, rows)
+    await ui.press({ key: K('clip.mp4') })
+    expect(height((await read()).top)).toBeLessThanOrEqual(rows + 1)
+  })
+
+  test('a text preview fits inside small panes (bodyRows 4..9)', async ($, on) => {
+    install(on, { 'long.txt': file(LINES(200)) })
+    const { ui, read } = await open($, 40, 4)
+    await ui.press({ key: K('long.txt') })
+    for (let rows = 4; rows <= 9; rows++) {
+      await ui.redraw(props(40, rows))
+      expect(height((await read()).top), `bodyRows ${rows}`).toBeLessThanOrEqual(rows + 1)
+    }
+  })
+
+  test('a wrapped tree row taller than the tree room does not push the preview out of the pane', async ($, on) => {
+    const name = 'x'.repeat(150) + '.log'
+    install(on, { [name]: file(LINES(200)) })
+    const rows = 12
+    const { ui, read } = await open($, 40, rows)
+    await ui.press({ key: K(name) })
+    const v = await read()
+    expect(v.box).toBeDefined()
+    expect(height(v.top)).toBeLessThanOrEqual(rows + 1)
+  })
+
+  test('a wheel tick over the first row of the preview box scrolls the preview, even under a tall tree row', async ($, on) => {
+    const name = 'x'.repeat(150) + '.log'
+    install(on, { [name]: file(LINES(200)) })
+    const rows = 12
+    const { ui, read } = await open($, 40, rows)
+    await ui.press({ key: K(name) })
+    const v = await read()
+    const kids = (v.top.children ?? []).filter(isEl)
+    // The row the box's first line lands on, as drawn.
+    const boxRow = height(kids[0]) + height(kids[1])
+    await scroll($, 2, rows, boxRow - 1)
+    // A tick over the tall row (above the box) must not scroll the preview.
+    expect((await read()).source?.split('\n')[0]).toBe('line 0')
+  })
+
+  test('End (by = contentRows) takes the cursor to the last row', async ($, on) => {
+    install(on, Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`f${String(i).padStart(3, '0')}.txt`, file()])))
+    const rows = 20
+    const { read } = await open($, 40, rows)
+    // The engine sends End as by = contentRows; the plugin pads content to bodyRows + 1, so End moves 21 rows.
+    await scroll($, rows + 1, rows)
+    expect((await read()).cursor).toBe('f099.txt')
+  })
+
+  test('a root-level file deleted under the cursor leaves the cursor on a neighbouring row', async ($, on) => {
+    const w = install(on, { 'a.txt': file(), 'b.txt': file(), 'c.txt': file() })
+    const { ui, read } = await open($)
+    await ui.press({ key: K('b.txt') })
+    expect((await read()).cursor).toBe('b.txt')
+    remove(w, 'b.txt')
+    await ui.redraw()
+    const v = await read()
+    // The cursor falls back to '' (no row marked) while the hint still claims 1/2.
+    expect(v.cursor).toBeDefined()
+  })
+
+  test('two surfaces showing the pane do not share the wheel geometry', async ($, on) => {
+    install(on, { 'a.txt': file(), 'long.txt': file(LINES(200)), 'z.txt': file() })
+    const big = await open($, 40, 30, 'terminal')
+    await big.ui.press({ key: K('long.txt') })
+    // A second, shorter surface draws after it; its previewFrom overwrites the terminal's.
+    const small = await open($, 40, 10, 'desktop')
+    await small.read()
+    // Row 8 is a tree row on the 30-row terminal (its box starts lower), so the wheel walks the cursor.
+    await scroll($, 1, 30, 8)
+    const v = await big.read()
+    expect(v.source?.split('\n')[0]).toBe('line 0')
+    expect(v.cursor).toBe('z.txt')
+  })
+
+  test('row keys stay distinct for a name with a lone surrogate and one spelling its escape', async ($, on) => {
+    install(on, { 'a\ud800': file('one'), 'a￾d800': file('two') })
+    const { read } = await open($)
+    const keys = (await read()).rows.map(r => r.key)
+    expect(new Set(keys).size).toBe(2)
   })
 })
