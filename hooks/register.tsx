@@ -2,6 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 const PANE = 'file-tree'
+// The dock width asked for; one the person dragged wins, and without a request the dock can leave the chat a sliver.
+const DOCK_COLUMNS = 56
 const SKIP = new Set(['.git', 'node_modules', '.DS_Store'])
 const expanded = atom({ plugin: 'file-tree', key: 'expanded' } as const, [] as string[])
 const tick = atom({ plugin: 'file-tree', key: 'tick' } as const, 0)
@@ -10,12 +12,14 @@ const cursor = atom({ plugin: 'file-tree', key: 'cursor' } as const, '')
 // Mirrors of what the last draw showed, so the ui.scroll hook can move the cursor without redrawing first.
 let order: string[] = []
 let at = ''
-let top = 0
-// Preview window: first visible row, its last offset, and the body row where the box starts (Infinity: no box).
-let pTop = 0
-let pMax = 0
-let previewFrom = Infinity
+// The cursor atom as last read: a render adopts it only when it changed, so a fallback chosen in render sticks.
+let atomAt = ''
 let shown = ''
+// Each surface has its own window: tree top, preview top and last offset, and the body row where the box starts
+// (Infinity: no box). ui.scroll names no surface, so it finds its window by bodyRows.
+type Geo = { bodyRows: number; top: number; pTop: number; pMax: number; previewFrom: number; seq: number }
+const geos = new Map<string, Geo>()
+let renders = 0
 
 // $.fs.read and the stdout of $.process.run both stop at 4 MiB, so that is how much of a file one preview holds.
 const READ_MAX = 4 * 1024 * 1024
@@ -28,10 +32,20 @@ const OPAQUE = new Set([
   'zip', 'gz', 'tar', 'tgz', '7z', 'rar', 'dmg', 'iso', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
   'pages', 'numbers', 'key', 'psd', 'sketch', 'fig', 'sqlite', 'db', 'exe', 'bin', 'woff', 'woff2', 'ttf', 'otf',
 ])
+// Keyed by path, mtime and size, so a file rewritten on disk is measured and read again; each keeps its newest few.
 const sizes = new Map<string, { w: number; h: number } | null>()
+// A PNG is up to 2.7 MB of base64, so only the last few previewed stay.
 const pngs = new Map<string, string | null>()
 // The wrapped text of the previewed file, so a wheel tick slices rows instead of re-reading the file.
-let loaded: { sig: string; rows: string[]; opaque: string } | undefined
+const loaded = new Map<string, { rows: string[]; opaque: string }>()
+const remember = <V,>(map: Map<string, V>, key: string, value: V, max: number) => {
+  map.delete(key)
+  map.set(key, value)
+  for (const old of map.keys()) {
+    if (map.size <= max) break
+    map.delete(old)
+  }
+}
 
 const human = (n: number) =>
   n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`
@@ -99,21 +113,29 @@ const chunk = (text: string, width: number) => {
   return out
 }
 const fit = (text: string, width: number) => {
-  let out = ''
+  const kept: [string, number][] = []
   let used = 0
   for (const ch of text) {
     const c = cells(ch.codePointAt(0)!)
-    if (used + c > width) return Array.from(out).slice(0, -1).join('') + '…'
-    out += ch
+    if (used + c > width) {
+      // Drop back until the ellipsis fits: a dropped combining mark frees no cell.
+      while (kept.length && used + 1 > width) used -= kept.pop()![1]
+      return kept.map(k => k[0]).join('') + '…'
+    }
+    kept.push([ch, c])
     used += c
   }
   return text
 }
+// The first n of a wrapped text's lines, the last marked as cut when lines were left over.
+const clip = (lines: string[], n: number, width: number) =>
+  lines.length <= n ? lines : n <= 0 ? [] : [...lines.slice(0, n - 1), fit(`${lines[n - 1]} …`, width)]
 
 // encodeURIComponent is one-to-one and free of control characters, so two names never share a key or collide with a button's.
-// A lone surrogate would make encodeURIComponent throw and take the whole render with it, so it is spelled out first.
+// It throws on a lone surrogate, so those are spelled U+FFFE plus four hex digits first; a U+FFFE in the name is
+// spelled the same way, so no spelling can equal another name.
 const rowKey = (path: string) =>
-  `r:${encodeURIComponent(path.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, c => `\ufffe${c.charCodeAt(0).toString(16)}`))}`
+  `r:${encodeURIComponent(path.replace(/\ufffe|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, c => `\ufffe${c.charCodeAt(0).toString(16).padStart(4, '0')}`))}`
 
 // The engine wraps an OS refusal in its own prefix and sets no `code`; the errno is the E-token in the message.
 const errno = (err: unknown) => {
@@ -122,55 +144,73 @@ const errno = (err: unknown) => {
   return msg.match(/\bE[A-Z0-9]{3,}\b[^,'()\n]*/)?.[0] ?? ''
 }
 
-type Row = { path: string; name: string; depth: number; isDir: boolean; lines: string[] }
+type Row = { path: string; name: string; depth: number; isDir: boolean; lines: string[]; width: number }
 type Stat = { kind: 'file' | 'dir' | 'other'; size: number; mtimeMs: number; isLink: boolean; realPath?: string }
+
+// Focus calls run in order and each names the cursor as it is by then, so a burst of wheel ticks ends on the last row.
+let focusing: Promise<unknown> = Promise.resolve()
+const focusCursor = ($: any) => {
+  focusing = focusing.then(() => $.ui.focus({ requestId: PANE, key: rowKey(at) })).catch(() => undefined)
+}
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'tree', description: 'Show the project file tree in a pane' })
-    void $.ui.open({ id: PANE, title: 'Files' })
+    void $.ui.open({ id: PANE, title: 'Files', columns: DOCK_COLUMNS })
     // The pane takes the keys only through ctrl+x Tab; naming it where the prompt is makes it findable.
     $.ui.status('files: ctrl+x Tab to enter, Esc to return')
     return next(e)
   })
 
   on('command.run', { command: 'tree' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'Files' })
+    await $.ui.open({ id: PANE, title: 'Files', columns: DOCK_COLUMNS })
     return { text: 'File tree opened.' }
   })
 
   // The engine scrolls a focused pane with the arrows; taking the move here lets them walk the rows instead.
   on('ui.scroll', { requestId: PANE }, async ($, e) => {
+    const g = [...geos.values()].find(x => x.bodyRows === e.bodyRows)
     // A wheel over the preview box scrolls the box; everywhere else it walks the tree.
-    if (e.pointer && e.pointer.row >= previewFrom) {
-      pTop = Math.max(0, Math.min(pMax, pTop + e.by))
-      await update($, tick, n => n + 1)
+    if (g && e.pointer && e.pointer.row >= g.previewFrom) {
+      g.pTop = Math.max(0, Math.min(g.pMax, g.pTop + e.by))
+      await update($, tick, n => n + 1).catch(() => undefined)
       return {}
     }
     if (order.length === 0) return {}
+    // Home and End ask for contentRows, which the padding keeps near bodyRows, far short of a long list's ends.
+    const ends = !e.pointer && Math.abs(e.by) >= e.contentRows
     const from = Math.max(0, order.indexOf(at))
-    at = order[Math.min(order.length - 1, Math.max(0, from + e.by))] ?? at
-    await update($, cursor, () => at)
-    void $.ui.focus({ requestId: PANE, key: rowKey(at) }).catch(() => undefined)
+    const to = ends ? (e.by > 0 ? order.length - 1 : 0) : from + e.by
+    at = order[Math.min(order.length - 1, Math.max(0, to))] ?? at
+    await update($, cursor, () => at).catch(() => undefined)
+    focusCursor($)
     return {}
   })
 
   // Redraw after any tool that can add, rename or delete files.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
-    await update($, tick, n => n + 1)
+    await update($, tick, n => n + 1).catch(() => undefined)
     return ran
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Code, Image } = $.ui.resolve(e) as ReturnType<typeof $.ui.resolve> & { Image?: any }
+    const seq = ++renders
+    const g: Geo = geos.get(e.surface) ?? { bodyRows: 0, top: 0, pTop: 0, pMax: 0, previewFrom: Infinity, seq }
+    geos.set(e.surface, g)
+    g.seq = seq
     const open = new Set(await read($, expanded))
     const chosen = await read($, selected)
-    at = (await read($, cursor)) || at
+    const want = await read($, cursor)
+    if (want !== atomAt) {
+      atomAt = want
+      if (want) at = want
+    }
     await read($, tick)
     if (chosen !== shown) {
       shown = chosen
-      pTop = 0
+      for (const x of geos.values()) x.pTop = 0
     }
 
     // The pane's own body size, not the terminal's: a taller tree makes the engine scroll the window.
@@ -200,24 +240,37 @@ export const register: Register = on => {
         const isDir = dirs.has(x.name)
         // Cells before the name: the marker, the indent and the glyph; "[ " and " ]" take four more.
         const lead = 1 + 2 * Math.min(depth, maxDepth) + 2
-        rows.push({ path, name: x.name, depth, isDir, lines: chunk(cleanName(x.name), cols - 4 - lead) })
+        rows.push({ path, name: x.name, depth, isDir, lines: chunk(cleanName(x.name), cols - 4 - lead), width: cols - 4 - lead })
         if (isDir && open.has(path)) await walk(path, depth + 1)
       }
     }
     await walk('', 0)
+    const before = order
     order = rows.map(r => r.path)
 
-    // A folder collapsed or a file deleted under the cursor leaves it on its nearest row that still exists.
-    while (at && !order.includes(at)) at = at.includes('/') ? at.slice(0, at.lastIndexOf('/')) : ''
+    // A file deleted under the cursor leaves it on the next (or previous) sibling; with none left, or a folder
+    // collapsed over it, on the nearest folder above that still shows.
+    if (at && !order.includes(at)) {
+      const parent = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf('/')))
+      const i = before.indexOf(at)
+      const near = i < 0 ? undefined : [...before.slice(i + 1), ...before.slice(0, i).reverse()].find(p => order.includes(p) && parent(p) === parent(at))
+      let up = parent(at)
+      while (up && !order.includes(up)) up = parent(up)
+      at = near ?? up
+    }
+    if (!order.includes(at)) at = order[0] ?? ''
 
     const toggle = (path: string) =>
       update($, expanded, list =>
         list.includes(path) ? list.filter(p => p !== path) : [...list, path],
       )
 
-    const hintRows = chunk(`${order.length ? Math.max(0, order.indexOf(at)) + 1 : 0}/${rows.length} · ↑↓ move · Enter open · Tab also walks · Esc back`, cols - 1)
-    // Title, one line and the border are the least a box can be; above that it takes up to 60% and leaves the tree three rows.
-    const maxBox = Math.max(4, Math.min(Math.floor(bodyRows * 0.6), bodyRows - hintRows.length - 3))
+    const hint = `${order.indexOf(at) + 1}/${rows.length} · ↑↓ move · Enter open · Tab also walks · Esc back`
+    // Under 12 rows the hint keeps to one line, and under 6 it gives its row to the tree.
+    const hintRows = bodyRows >= 12 ? chunk(hint, cols - 1) : bodyRows >= 6 ? [fit(hint, cols - 1)] : []
+    // The box takes up to 60% and leaves the tree three rows (one in a small pane); title and border are its least.
+    const avail = bodyRows - hintRows.length
+    const maxBox = Math.max(3, Math.min(avail - (avail >= 10 ? 3 : 1), Math.max(4, Math.floor(bodyRows * 0.6))))
 
     let st: Stat | undefined
     let statErr = ''
@@ -236,24 +289,27 @@ export const register: Register = on => {
     // Only a regular file reaches sips; a pipe named .png would block it until the 30 s timeout.
     const isImage = IMAGE.has(ext(chosen)) && st?.kind === 'file'
     const real = st?.realPath ?? chosen
-    if (isImage && st && !sizes.has(chosen)) {
+    // A relative name starting with a dash would read as an option to sips, open and xdg-open.
+    const arg = real.startsWith('-') ? `./${real}` : real
+    const imgKey = `${chosen}|${st?.mtimeMs}|${st?.size}`
+    if (isImage && st && !sizes.has(imgKey)) {
       const out = await $.process
-        .run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', real])
+        .run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', arg])
         .catch(() => undefined)
       const w = Number(out?.stdout.match(/pixelWidth:\s*(\d+)/)?.[1])
       const h = Number(out?.stdout.match(/pixelHeight:\s*(\d+)/)?.[1])
-      sizes.set(chosen, w && h ? { w, h } : null)
+      remember(sizes, imgKey, w && h ? { w, h } : null, 256)
     }
-    const dim = sizes.get(chosen)
+    const dim = sizes.get(imgKey)
 
     // Real pixels via the terminal's own image support; sips makes a PNG, shrunk until it fits the 2 MiB the Image takes.
-    if (isImage && dim && Image && !pngs.has(chosen)) {
+    if (isImage && dim && Image && !pngs.has(imgKey)) {
       let b64: string | null = null
       const dir = (await $.process.run(['mktemp', '-d']).catch(() => undefined))?.stdout.trim()
       if (dir) {
         for (const edge of [900, 600, 400, 256, 128]) {
           const out = `${dir}/p.png`
-          await $.process.run(['sips', '-s', 'format', 'png', '-Z', String(edge), real, '--out', out]).catch(() => undefined)
+          await $.process.run(['sips', '-s', 'format', 'png', '-Z', String(edge), arg, '--out', out]).catch(() => undefined)
           const raw = await $.fs.read(out, { as: 'bytes' }).catch(() => undefined)
           if (raw && typeof raw !== 'string' && (raw.base64.length * 3) / 4 <= IMAGE_MAX) {
             b64 = raw.base64
@@ -262,21 +318,19 @@ export const register: Register = on => {
         }
         await $.process.run(['rm', '-rf', dir]).catch(() => undefined)
       }
-      pngs.set(chosen, b64)
+      remember(pngs, imgKey, b64, 8)
     }
-    const png = pngs.get(chosen)
+    const png = pngs.get(imgKey)
 
     // What the box holds: wrapped text rows, or (opaque) the reason no preview is drawn.
     let textRows: string[] = []
     let opaque = ''
     if (chosen && !isImage) {
       const sig = `${cols}|${chosen}|${st?.mtimeMs}|${st?.size}|${statErr}`
-      if (loaded?.sig !== sig) {
-        const made = await loadText($, chosen, st, statErr, cols - 6)
-        loaded = { sig, ...made }
-      }
-      textRows = loaded.rows
-      opaque = loaded.opaque
+      const made = loaded.get(sig) ?? (await loadText($, chosen, st, statErr, cols - 6))
+      remember(loaded, sig, made, 4)
+      textRows = made.rows
+      opaque = made.opaque
     }
 
     const pathRows = chunk(cleanName(real), cols - 6)
@@ -284,25 +338,27 @@ export const register: Register = on => {
     const headRows = chunk(headline, cols - 6)
     const imgCols = Math.max(8, Math.min(80, cols - 6))
     const drawImg = !!(isImage && dim && png && Image)
-    // Border and title, headline and path rows, and the two buttons share the box with the picture.
-    const chrome = 3 + headRows.length + pathRows.length + 2
-    const imgRows = drawImg && dim ? Math.max(1, Math.min(maxBox - chrome, Math.round((imgCols * dim.h) / dim.w / 2))) : 0
-    const boxRows = !chosen
-      ? 0
-      : isImage
-        ? chrome + imgRows
-        : opaque
-          ? Math.min(maxBox, chrome + 1)
-          : Math.min(maxBox, textRows.length + 3)
+    // Every row counted here is drawn, so the body stays bodyRows + 1 tall, as the arrow keys need.
+    // Past border and title the box fills in order: the two buttons, the headline, the path, the picture.
+    let room = maxBox - 3
+    const buttons = Math.min(2, room)
+    room -= buttons
+    const headShown = clip(headRows, room, cols - 6)
+    room -= headShown.length
+    const pathShown = clip(pathRows, room, cols - 6)
+    room -= pathShown.length
+    const imgRows = drawImg && dim ? Math.min(room, 255, Math.max(1, Math.round((imgCols * dim.h) / dim.w / 2))) : 0
+    const textBox = Math.min(maxBox, textRows.length + 3)
+    const boxRows = !chosen ? 0 : isImage || opaque ? 3 + buttons + headShown.length + pathShown.length + imgRows : textBox
     // A long text gets a footer row for the jump buttons: a wheel tick moves a few rows, too slow to cross a big file.
     const footer = !isImage && !opaque && textRows.length > boxRows - 3 && boxRows >= 6
-    const previewRoom = Math.max(1, boxRows - 3 - (footer ? 1 : 0))
-    pMax = Math.max(0, textRows.length - previewRoom)
-    pTop = Math.min(pTop, pMax)
+    const previewRoom = Math.max(0, boxRows - 3 - (footer ? 1 : 0))
+    const pMax = Math.max(0, textRows.length - previewRoom)
+    const pTop = Math.min(g.pTop, pMax)
 
     // The tree takes whatever the box leaves, so a short preview sits at the bottom and a long one grows upward.
-    const treeRoom = Math.max(3, bodyRows - hintRows.length - boxRows)
-    previewFrom = chosen ? hintRows.length + treeRoom : Infinity
+    const treeRoom = Math.max(1, bodyRows - hintRows.length - boxRows)
+    let top = g.top
 
     // Keep the cursor inside the window; rows may be several cells tall, so the window counts cells.
     const idx = Math.max(0, order.indexOf(at))
@@ -317,43 +373,50 @@ export const register: Register = on => {
     let used = 0
     for (const r of rows.slice(top)) {
       if (used + r.lines.length > treeRoom && shownRows.length) break
-      shownRows.push(r)
-      used += r.lines.length
+      // A row taller than the whole window keeps the lines that fit.
+      const lines = clip(r.lines, treeRoom - used, r.width)
+      shownRows.push({ ...r, lines })
+      used += lines.length
     }
+    // A slower render that finishes after a newer one leaves the newer one's window in place.
+    if (g.seq === seq) Object.assign(g, { bodyRows, top, pTop, pMax, previewFrom: chosen ? hintRows.length + treeRoom : Infinity })
 
     // The close button unmounts with the box and the engine hands its focus to whichever row now sits there; put it back on the cursor.
     const closePreview = async () => {
       await update($, selected, () => '')
-      void $.ui.focus({ requestId: PANE, key: rowKey(at) }).catch(() => undefined)
+      focusCursor($)
     }
 
     const launch = async (tries: string[][], done: string, fail: string) => {
       for (const argv of tries) {
         const r = await $.process.run(argv).catch(() => undefined)
-        // explorer and start report 1 on success.
-        if (r && (r.exitCode === 0 || argv[0] === 'explorer' || argv[0] === 'cmd')) return $.ui.toast(done)
+        // explorer reports 1 on success.
+        if (r && (r.exitCode === 0 || argv[0] === 'explorer')) return $.ui.toast(done)
       }
       $.ui.toast(fail)
     }
     const reveal = () =>
       launch(
-        [['open', '-R', real], ['xdg-open', real.replace(/\/[^/]*$/, '')], ['explorer', `/select,${real}`]],
+        [['open', '-R', arg], ['xdg-open', real.includes('/') ? real.slice(0, real.lastIndexOf('/')) || '/' : '.'], ['explorer', `/select,${real}`]],
         'Shown in your file manager',
         'Could not open a file manager',
       )
     const openDefault = () =>
-      launch([['open', real], ['xdg-open', real], ['cmd', '/c', 'start', '', real]], 'Opened', 'No app could open this file')
+      // Not `cmd /c start`: cmd parses the name again, and a file named `a&calc` would run calc.
+      launch([['open', arg], ['xdg-open', arg], ['explorer', real]], 'Opened', 'No app could open this file')
 
     const range = fit(`${pTop + 1}-${Math.min(textRows.length, pTop + previewRoom)}/${textRows.length}`, Math.max(1, cols - 6 - 12))
     const jump = async (to: number) => {
-      pTop = to
+      g.pTop = to
       await update($, tick, n => n + 1)
     }
-    const title = fit(cleanName(chosen), Math.max(6, cols - 6 - 4 - 17))
+    // A narrow box drops "(press to close)" before the title would wrap.
+    const closeHint = cols - 6 - 4 - 17 >= 6
+    const title = fit(cleanName(chosen), Math.max(1, cols - 6 - 4 - (closeHint ? 17 : 0)))
 
     return (
       <Box flexDirection="column">
-        <Text dimColor>{hintRows.join('\n')}</Text>
+        {hintRows.length > 0 && <Text dimColor>{hintRows.join('\n')}</Text>}
         <Box flexDirection="column">
           {shownRows.map(r => {
             const pad = '│ '.repeat(Math.min(r.depth, maxDepth))
@@ -392,30 +455,38 @@ export const register: Register = on => {
           <Box flexDirection="column" borderStyle="round" paddingX={1}>
             <Button key="close-preview" onPress={() => closePreview()}>
               <Text weight="bold">{title} </Text>
-              <Text dimColor>(press to close)</Text>
+              {closeHint && <Text dimColor>(press to close)</Text>}
             </Button>
             {isImage || opaque ? (
               <Box flexDirection="column">
-                <Text>{headRows.join('\n')}</Text>
-                <Text dimColor>{pathRows.join('\n')}</Text>
-                {drawImg && (
-                  <Image
-                    source={{ png }}
-                    columns={imgCols}
-                    rows={imgRows}
-                    alt="(your terminal cannot draw images here)"
-                  />
+                {headShown.length > 0 && <Text>{headShown.join('\n')}</Text>}
+                {pathShown.length > 0 && <Text dimColor>{pathShown.join('\n')}</Text>}
+                {imgRows > 0 && (
+                  // Where the terminal cannot draw pictures the engine draws the alt on one line; the height keeps the rest.
+                  <Box height={imgRows} flexShrink={0}>
+                    <Image
+                      source={{ png }}
+                      columns={imgCols}
+                      rows={imgRows}
+                      alt="(your terminal cannot draw images here)"
+                    />
+                  </Box>
                 )}
-                <Button key="open-default" onPress={() => void openDefault()}>
-                  <Text color="cyan">Open</Text>
-                </Button>
-                <Button key="reveal" onPress={() => void reveal()}>
-                  <Text color="cyan">Show in file manager</Text>
-                </Button>
+                {buttons >= 1 && (
+                  <Button key="open-default" onPress={() => void openDefault()}>
+                    <Text color="cyan">Open</Text>
+                  </Button>
+                )}
+                {buttons >= 2 && (
+                  <Button key="reveal" onPress={() => void reveal()}>
+                    <Text color="cyan">Show in file manager</Text>
+                  </Button>
+                )}
               </Box>
-            ) : (
+            ) : previewRoom > 0 && (
               <Code
-                source={textRows.slice(pTop, pTop + previewRoom).join('\n')}
+                // Code drops empty lines, so a blank one is drawn as a space and keeps its row.
+                source={textRows.slice(pTop, pTop + previewRoom).map(l => l || ' ').join('\n')}
                 language={LANG[ext(chosen)]}
                 path={cleanName(chosen)}
                 wrap="truncate-end"

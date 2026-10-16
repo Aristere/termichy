@@ -139,6 +139,7 @@ const height = (x: unknown): number => {
   if (!isEl(x)) return 0
   const kids = (x.children ?? []).filter(isEl)
   if (x.type === 'Box') {
+    if (typeof x.props?.height === 'number') return x.props.height
     const inner = x.props?.flexDirection === 'row' ? Math.max(0, ...kids.map(height)) : kids.reduce((n, k) => n + height(k), 0)
     return inner + (x.props?.borderStyle ? 2 : 0)
   }
@@ -177,7 +178,7 @@ const all = (x: unknown, out: El[] = []): El[] => {
 const PANE = 'file-tree'
 // Row keys as register.tsx spells them; the test presses rows by path through this.
 const K = (path: string) =>
-  `r:${encodeURIComponent(path.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, c => `\ufffe${c.charCodeAt(0).toString(16)}`))}`
+  `r:${encodeURIComponent(path.replace(/\ufffe|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, c => `\ufffe${c.charCodeAt(0).toString(16).padStart(4, '0')}`))}`
 const unK = (key: string) => (key.startsWith('r:') ? decodeURIComponent(key.slice(2)) : key)
 declare const console: { log: (...a: unknown[]) => void }
 const props = (bodyColumns: number, bodyRows: number) => ({
@@ -194,8 +195,9 @@ const open = async ($: Engine, cols = 40, rows = 20, surface: 'terminal' | 'desk
   const read = async () => {
     const top = (await ui.drawn()) as unknown as El
     const kids = (top.children ?? []).filter(isEl)
-    const hint = textOf(kids[0])
-    const treeBox = kids[1]
+    // Under 6 body rows the hint gives its row to the tree and is not drawn.
+    const hint = kids[0]?.type === 'Text' ? textOf(kids[0]) : ''
+    const treeBox = kids.find(k => k.type === 'Box' && !k.props?.borderStyle)
     const box = kids.find(k => k.props?.borderStyle === 'round')
     const tree = (treeBox?.children ?? []).filter(isEl)
     const rows = tree
@@ -265,7 +267,7 @@ describe('tree', () => {
       const v = await read()
       expect([v.at, v.of]).toEqual([1, 1])
       expect(v.rows.map(r => r.path)).toEqual(['a.txt'])
-      expect(v.rows[0]?.label).toBe(' · a.txt')
+      expect(v.rows[0]?.label).toBe('›· a.txt')
     })
   }
 
@@ -335,8 +337,9 @@ describe('tree', () => {
   test('a very long name wraps, each line inside bodyColumns, nothing lost', async ($, on) => {
     const name = 'x'.repeat(150) + '.log'
     install(on, { [name]: file() })
+    // Tall enough for the whole name: a row taller than the window is clipped to it.
     for (const cols of [40, 23, 15]) {
-      const { ui, read } = await open($, cols)
+      const { ui, read } = await open($, cols, 60)
       const v = await read()
       expect(rowLinesFit(v.rows, cols), `cols ${cols}`).toEqual([])
       expect((v.rows[0]?.label ?? '').split('\n').map((l, i) => (i ? l.trimStart() : l.slice(3))).join('')).toBe(name)
@@ -381,7 +384,7 @@ describe('tree', () => {
     const { ui, read } = await open($)
     const v = await read()
     expect(v.rows.map(r => r.path)).toEqual(['lnk', 'real', 'a.txt'])
-    expect(v.rows[0]?.label).toBe(' ▸ lnk')
+    expect(v.rows[0]?.label).toBe('›▸ lnk')
     await ui.press({ key: K('lnk') })
     expect((await read()).rows.map(r => r.path)).toContain('lnk/inner.txt')
   })
@@ -389,7 +392,7 @@ describe('tree', () => {
   test('a broken symlink is a row; its preview says Broken link and nothing is read', async ($, on) => {
     const w = install(on, { dangling: link('gone/nowhere') })
     const { ui, read } = await open($)
-    expect((await read()).rows.map(r => r.label)).toEqual([' · dangling'])
+    expect((await read()).rows.map(r => r.label)).toEqual(['›· dangling'])
     await ui.press({ key: K('dangling') })
     expect((await read()).boxText).toContain('Broken link')
     expect(w.reads).toEqual([])
@@ -682,7 +685,8 @@ describe('ui.scroll', () => {
       const rows = all(v.top).filter(e => e.type === 'Button' && String(e.props?.key).startsWith('r:'))
       return rows.filter(b => all(b).some(t => t.type === 'Text' && t.props?.underline === true)).map(b => unK(String(b.props?.key)))
     }
-    expect(await underlined()).toEqual([])
+    // The cursor starts on the first row.
+    expect(await underlined()).toEqual(['d'])
     await ui.press({ key: K('b.txt') })
     expect(await underlined()).toEqual(['b.txt'])
     await ui.press({ key: K('d') })
@@ -729,13 +733,16 @@ describe('sizes', () => {
     await read()
   })
 
-  test('a very short pane (bodyRows 4) draws without throwing', async ($, on) => {
+  test('a very short pane (bodyRows 4) keeps a tree row and the preview title', async ($, on) => {
     install(on, NAMES)
     const { ui, read } = await open($, 40, 4)
     await ui.press({ key: K('a.txt') })
     const v = await read()
-    expect(v.source).toContain('hello  world')
-    expect(v.treeHeight).toBeGreaterThanOrEqual(3)
+    expect(v.title).toContain('a.txt')
+    expect(v.treeHeight).toBeGreaterThanOrEqual(1)
+    expect(height(v.top)).toBe(5)
+    await ui.redraw(props(40, 5))
+    expect((await read()).source).toContain('hello  world')
     await scroll($, 1, 4, 3)
     await scroll($, 1, 4)
     await read()
@@ -950,5 +957,48 @@ describe('audit', () => {
     const { read } = await open($)
     const keys = (await read()).rows.map(r => r.key)
     expect(new Set(keys).size).toBe(2)
+  })
+})
+
+// Fixes for what the end-user run found, which the audit tests above do not cover.
+describe('e2e', () => {
+  test('blank lines in a text preview keep their rows', async ($, on) => {
+    install(on, { 'blank.txt': file('a\n\nb\n\n\nc\n') })
+    const { ui, read } = await open($, 40, 20)
+    await ui.press({ key: K('blank.txt') })
+    const v = await read()
+    expect(v.source?.split('\n')).toEqual(['a', ' ', 'b', ' ', ' ', 'c'])
+    expect(height(v.top)).toBe(21)
+  })
+
+  test('Home (by = -contentRows) takes the cursor to the first row', async ($, on) => {
+    install(on, Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`f${String(i).padStart(3, '0')}.txt`, file()])))
+    const { read } = await open($, 40, 20)
+    await scroll($, 21, 20)
+    expect((await read()).cursor).toBe('f099.txt')
+    await scroll($, -21, 20)
+    expect((await read()).cursor).toBe('f000.txt')
+  })
+
+  test('/tree asks the dock for a width', async ($, on) => {
+    const asked: (number | undefined)[] = []
+    on('ui.open', async (_$, e) => {
+      asked.push(e.columns)
+      return { value: { isPlaced: true } }
+    })
+    await $.command.run({ command: 'tree', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+    expect(asked[0]).toBeGreaterThan(0)
+  })
+
+  test('Open never goes through cmd, which would parse the name again', async ($, on) => {
+    const w = install(on, { 'a&calc.mp4': file('x'), '-dash.mp4': file('y') })
+    const { ui } = await open($, 60, 20)
+    for (const name of ['a&calc.mp4', '-dash.mp4']) {
+      await ui.press({ key: K(name) })
+      await ui.press({ key: 'open-default' })
+    }
+    expect(w.runs.some(r => r[0] === 'cmd')).toBe(false)
+    // Every launcher gets the name as a path, never as an option.
+    expect(w.runs.filter(r => r[0] === 'open' || r[0] === 'xdg-open').every(r => !r[r.length - 1]?.startsWith('-'))).toBe(true)
   })
 })

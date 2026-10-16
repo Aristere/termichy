@@ -6,14 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `file-tree` is a Claude Code plugin (a "mod") that opens a project file tree and file preview in a pane. It is not a Node package: there is no `package.json`, no bundler and no build step. Claude Code loads `hooks/register.tsx` directly, via `hooks/hooks.json` (`{ "modules": ["./register.tsx"] }`).
 
-The sibling `../test/` folder and the loose files in `..` (images, `random-notes.txt`) are fixtures for trying the pane by hand (many files, deep folders, a very long folder name, an mp4 and a png). They are not part of the plugin.
+There are no fixtures in the repo. To try the pane by hand, build a scratch folder outside it with many files, deep folders, a very long name, CJK/emoji names, a symlink and a dangling one, a `chmod 000` file, a >4 MiB text file, a binary, a png/jpg, an mp4 and a fifo.
 
 ## Commands
 
 - Type-check: `tsc -p tsconfig.json` (no emit). `tsconfig.json` extends `.claude-plugin/types/tsconfig.json`, which is strict, uses `noUncheckedIndexedAccess`, and compiles `hooks/`, `types/` and `tests/` with a `h`/`Fragment` JSX factory.
 - Tests: `claude plugin test <plugin folder>` runs `tests/file-tree.test.ts` against the engine (the kit is `claude-code/testing`). Also run `claude plugin validate <plugin folder>`, which checks the manifest, the `PluginState` contract and the hooks' calls. A new `atom` missing from `types/index.d.ts` fails validation.
 - Run it: `claude --plugin-dir <plugin folder>` (the folder hot-reloads on edit). The pane opens on `session.start`, or with `/tree`. Per the status line, `ctrl+x Tab` enters the pane and `Esc` returns.
-- Layout: with `CLAUDE_CODE_NO_FLICKER=1` (fullscreen layout, 110+ columns) the pane docks on the right. Without it the pane renders inline above the prompt as a short block. An unasked `$.ui.open` (the one in `session.start`) is only placed from 144 columns; `/tree` is placed from 110.
+- Layout: the fullscreen layout (the default in 2.1.302; `CLAUDE_CODE_NO_FLICKER=0` turns it off) docks the pane on the right from 110 columns, and both opens ask the dock for `DOCK_COLUMNS`. With it off the pane renders inline above the prompt as a short block. The unasked open in `session.start` was seen placed at 120 columns.
 - Edit and test from two sessions. A session started with `--plugin-dir` pointing here cannot Write/Edit this folder under auto mode (the classifier will not judge an agent editing its own loaded plugin), so edit from a plain `claude` session and test from a second one started with `--plugin-dir` in the folder whose tree you want to see.
 
 ## Layout
@@ -27,12 +27,12 @@ The sibling `../test/` folder and the loose files in `..` (images, `random-notes
 State is split between engine atoms and module-level variables, and the split matters:
 
 - Atoms (`expanded`, `selected`, `cursor`, `tick`) are session state (`$.state`, not kept across sessions) read with `read($, atom)` and changed with `update($, atom, fn)`. Updating any of them re-triggers the `ui.render` hook. `tick` is only a redraw counter: bump it to force a render (after any `tool.call`, and on preview scroll).
-- Module variables (`order`, `at`, `top`, `pTop`, `pMax`, `previewFrom`, `shown`, `loaded`, and the `sizes`/`pngs` caches) mirror what the last render drew. Hooks outside render use them so they can act without a redraw. In particular `ui.scroll` reads `order`/`at` to move the cursor and `previewFrom` to tell a wheel over the preview box from one over the tree.
+- Module variables (`order`, `at`, `shown`, the per-surface windows in `geos`, and the `loaded`/`sizes`/`pngs` caches) mirror what the last render drew. Hooks outside render use them so they can act without a redraw. `ui.scroll` reads `order`/`at` to move the cursor, and finds its surface's window in `geos` by `bodyRows` (the event names no surface) to tell a wheel over the preview box (`previewFrom`) from one over the tree. The caches are keyed by path, mtime and size and keep only their newest few entries.
 
 Hooks:
 
 - `ui.render` (`component: 'Pane'`) rebuilds everything each time: walks the tree through `$.fs.list` honoring the `expanded` set, wraps names to the pane width, stats the selected file, picks image vs text vs "opaque" preview, then lays out hint line, tree window and preview box inside the pane's `bodyRows`. The tree gets whatever height the preview box leaves.
-- `ui.scroll` is how the arrow keys and wheel work. The engine scrolls a focused pane itself, so the render appends a padding row to keep the body taller than the pane, which is what makes arrow keys reach this hook. Keep that padding when editing the layout.
+- `ui.scroll` is how the arrow keys and wheel work. The engine scrolls a focused pane itself, so the render appends a padding row to keep the body taller than the pane, which is what makes arrow keys reach this hook. Keep that padding when editing the layout: every row the layout counts must be drawn (tree rows are clipped to the window, the image sits in a `Box` of fixed height because the engine draws its alt on one line), so the body is exactly `bodyRows + 1`. When it is not, the arrows move the engine's own focus instead and Enter presses the wrong row. Home and End arrive as `by = ±contentRows` with no pointer and jump to the ends.
 - `tool.call` redraws after any tool, since it may have changed the files on disk.
 - `session.start` registers `/tree` and opens the pane; `command.run` reopens it.
 
@@ -42,7 +42,7 @@ Preview rules in `loadText` and the render body:
 
 - Only regular files are read; pipes and devices are never opened because they can block. Images are only sent to `sips` if `stat` says `file`.
 - Text reads stop at 4 MiB (`READ_MAX`, the engine's limit for `$.fs.read` and process stdout); bigger files are read with `head -c` and get a "first N of M bytes" row. Extensions in `OPAQUE` skip the read.
-- Images go through macOS `sips` (size query, then PNG downscale through 900/600/400/256/128 px until under the 2 MiB `IMAGE_MAX`). Open and reveal buttons try `open`/`xdg-open`/`explorer` in turn, so the non-image paths are meant to stay cross-platform while image preview is macOS-only.
+- Images go through macOS `sips` (size query, then PNG downscale through 900/600/400/256/128 px until under the 2 MiB `IMAGE_MAX`). Open and reveal buttons try `open`/`xdg-open`/`explorer` in turn (never `cmd /c start`, which re-parses the name, so `a&calc` would run calc), so the non-image paths are meant to stay cross-platform while image preview is macOS-only.
 - Row buttons are keyed with `rowKey` (`encodeURIComponent` of the path, with lone surrogates spelled out first because `encodeURIComponent` throws on them) so names never collide with fixed button keys like `close-preview`.
 - OS refusals come back from the engine as text with no `code`; `errno` pulls the `E…` token (for example `EACCES`) out of the message for the box.
 - The cursor row is underlined as well as marked with `›`. The engine inverts whichever row rests under the mouse pointer (hover) and re-applies it after every relayout, so after closing a preview the highlight lands on the row now under a stationary pointer while the cursor stays put. That is the engine's behaviour and no `$.ui.focus` call changes it; the underline is what keeps the real cursor readable.
