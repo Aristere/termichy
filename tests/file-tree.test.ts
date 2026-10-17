@@ -1726,4 +1726,97 @@ describe('round 9', () => {
       await ui.unmount?.()
     }
   })
+
+  // Audit of 25bcc25.
+  test('a text file that fits its box has no scrollbar and Tab walks the rows as before', async ($, on) => {
+    ring(on)
+    install(on, { 'a.txt': file(), 'b.txt': file('one\ntwo'), 'c.txt': file() })
+    const { ui, read } = await open($, 50, 20)
+    await ui.press({ key: K('b.txt') })
+    let v = await read()
+    expect(bar(v.box)).toHaveLength(0)
+    expect(v.hint).not.toContain('Tab preview')
+    await tab($, K('c.txt'))
+    v = await read()
+    expect(v.cursor).toBe('c.txt')
+    expect(v.hint).not.toContain('scroll')
+  })
+
+  test('a file that shrinks to fit while the keys are in the preview gives them back to the tree', async ($, on) => {
+    ring(on)
+    const w = install(on, { 'a.txt': file(), 'n.txt': long(), 'z.txt': file() })
+    const rows = 20
+    const { ui, read } = await open($, 50, rows)
+    await ui.press({ key: K('n.txt') })
+    await tab($, K('z.txt'))
+    expect((await read()).hint).toContain('↑↓ scroll')
+    put(w, 'n.txt', { kind: 'file', text: 'short now', size: 9 })
+    await ui.redraw()
+    await scroll($, 1, rows)
+    const v = await read()
+    expect(v.cursor).toBe('z.txt')
+    expect(v.hint).not.toContain('scroll')
+  })
+
+  test('a pane too short for a three-cell bar draws none, keeps the text its width, and Tab still scrolls the file', async ($, on) => {
+    ring(on)
+    install(on, { 'a.txt': file(), 'n.txt': long() })
+    for (const rows of [5, 6, 7, 8]) {
+      const { ui, read } = await open($, 40, rows)
+      await ui.press({ key: K('n.txt') })
+      let v = await read()
+      expect(bar(v.box), `rows ${rows}`).toHaveLength(0)
+      expect(height(v.top), `rows ${rows}`).toBe(rows + 1)
+      // The window carries over from the last size, so the check is one row on from wherever it starts.
+      const first = Number(v.source?.split('\n')[0]?.slice(4))
+      await tab($, K('a.txt'))
+      await scroll($, 1, rows)
+      v = await read()
+      expect(v.source?.split('\n')[0], `rows ${rows}`).toBe(`row ${first + 1}`)
+      await tab($, K('a.txt'))
+      await ui.unmount?.()
+    }
+  })
+
+  test('a desktop surface draws no scrollbar (a plain Button is a native button there)', async ($, on) => {
+    install(on, { 'n.txt': long() })
+    const { ui, read } = await open($, 50, 20, 'desktop')
+    await ui.press({ key: K('n.txt') })
+    expect(bar((await read()).box)).toHaveLength(0)
+  })
+
+  test('a surface too narrow for a box leaves the other surface in the preview', async ($, on) => {
+    ring(on)
+    install(on, { 'a.txt': file(), 'n.txt': long(), 'z.txt': file() })
+    const rows = 20
+    const one = await open($, 50, rows)
+    await one.ui.press({ key: K('n.txt') })
+    await tab($, K('z.txt'))
+    const two = await open($, 12, 15, 'desktop')
+    await two.read()
+    await scroll($, 1, rows)
+    const v = await one.read()
+    expect(v.cursor).toBe('n.txt')
+    expect(v.range).toMatch(/^2-/)
+  })
+
+  test('a one-line minified file on two surfaces scrolls without laying the file out on every tick', { timeoutMs: 60000 }, async ($, on) => {
+    const words = Array.from({ length: 400000 }, (_, i) => `v${i % 97}`).join(',')
+    install(on, { 'm.js': file(words) })
+    const one = await open($, 60, 20)
+    await one.ui.press({ key: K('m.js') })
+    await one.read()
+    const two = await open($, 70, 24, 'desktop')
+    await two.read()
+    const times: number[] = []
+    for (let i = 0; i < 4; i++) {
+      const t = Date.now()
+      await scroll($, 1, 20, 18)
+      await one.read()
+      await two.read()
+      times.push(Date.now() - t)
+    }
+    console.log(`minified on two surfaces, ms per tick ${times.join(' ')}`)
+    expect(Math.max(...times)).toBeLessThan(50)
+  })
 })

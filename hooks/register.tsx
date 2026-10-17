@@ -29,9 +29,10 @@ type Geo = {
 }
 const geos = new Map<string, Geo>()
 // Tab from the tree puts the arrows, Home/End and the wheel on the text preview, with the ring resting on the box's
-// title; any other move of the ring (Tab again, a click) hands them back. `textShown`: the last drawing had a text preview.
+// title; any other move of the ring (Tab again, a click) hands them back. `scrollable`: the last box drawn held a text
+// taller than itself, the only kind Tab goes into.
 let inPreview = false
-let textShown = false
+let scrollable = false
 const PREVIEW_KEYS = new Set(['close-preview', 'jump-top', 'jump-end'])
 const isPreviewKey = (key: string) => PREVIEW_KEYS.has(key) || key.startsWith('sb-')
 // Renders run one at a time: one slowed by sips that finished after a newer one left the engine holding
@@ -134,7 +135,7 @@ const scan = (line: string, start: string, e: string, stops: number[] = []) => {
 
 // Soft-wraps one line to `width` cells, at the last space that leaves the row at least half full, else mid-word.
 // Continuation rows are indented past the line's own indent, so code keeps its shape; `at` is each row's offset.
-const wrapLine = (line: string, width: number) => {
+const wrapLine = (line: string, width: number, cap = Infinity) => {
   // A line of one-cell characters (most are) is wrapped on string offsets, skipping the per-character walk that a
   // 4 MiB log feels on every resize.
   const narrow = !/[\u0300-\u036f\u1100-\uffff]/.test(line)
@@ -164,7 +165,7 @@ const wrapLine = (line: string, width: number) => {
     rows.push({ at: offset, text: (rows.length ? pad : '') + piece })
     offset += piece.length
     start = end
-    if (start >= chars.length) break
+    if (start >= chars.length || rows.length > cap) break
   }
   return rows
 }
@@ -183,6 +184,28 @@ const layoutText = (made: Loaded, width: number): TextRow[] => {
     )
   })
   return out
+}
+// Whether a file takes more than `limit` rows at `width`, without laying all of it out: each line is a row at least, and
+// a line of one-cell characters ceil(length / width) of them, so only text that might fit is wrapped, and only until it
+// no longer does. Laying out a second width for this cost a minified file a full layout per wheel tick.
+const talls = new Map<string, boolean>()
+const overflows = (made: Loaded, width: number, limit: number, sig: string) => {
+  const key = `${sig}|${width}|${limit}`
+  let got = talls.get(key)
+  if (got === undefined) {
+    let n = made.lines.length
+    if (n <= limit) {
+      n = 0
+      for (const line of made.lines) n += /[\u0300-\u036f\u1100-\uffff]/.test(line) ? 1 : Math.max(1, Math.ceil(line.length / width))
+    }
+    if (n <= limit) {
+      n = 0
+      for (const line of made.lines) if ((n += wrapLine(line, width, limit - n).length) > limit) break
+    }
+    got = n > limit
+    remember(talls, key, got, 16)
+  }
+  return got
 }
 const remember = <V,>(map: Map<string, V>, key: string, value: V, max: number) => {
   map.delete(key)
@@ -423,7 +446,7 @@ export const register: Register = on => {
     // The event cannot tell Tab from a click, so a move to the row next to the cursor, or onto the box, is taken for
     // Tab; a click there still presses what it hit, and the row and box presses put the keys where they belong.
     const near = (p?: string) => p !== undefined && order.includes(p) && Math.abs(order.indexOf(p) - order.indexOf(at)) === 1
-    if ((!inPreview && textShown && (isPreviewKey(el) || near(pathOf(el)))) || (inPreview && el !== 'close-preview')) {
+    if ((!inPreview && scrollable && (isPreviewKey(el) || near(pathOf(el)))) || (inPreview && el !== 'close-preview')) {
       const entering = !inPreview
       const r = await next({ ...e, element: entering ? 'close-preview' : rowKey(at) })
       if (!r.deny) into(entering)
@@ -564,31 +587,38 @@ export const register: Register = on => {
         if (!made.opaque.startsWith('Cannot read')) remember(loaded, sig, made, 2)
       }
       const opaque = made.opaque
-      textShown = boxed && !isImage && !opaque
-      if (!textShown) inPreview = false
+      const text = boxed && !isImage && !opaque
 
-      // Both hints are 45 cells, so Tab between tree and preview never changes the hint's rows and with them the box.
-      const keys = !textShown ? '↑↓ move · Enter open · Esc back' : inPreview ? '↑↓ scroll · Enter close · Tab tree · Esc back' : '↑↓ move · Enter open · Tab preview · Esc back'
-      const hint = `${order.indexOf(at) + 1}/${rows.length} · ${keys}`
       // Under 12 rows the hint keeps to one line, and under 6 it gives its row to the tree.
-      const hintRows = bodyRows >= 12 ? chunk(hint, cols - 1) : bodyRows >= 6 ? [fit(hint, cols - 1)] : []
+      const hintOf = (keys: string) => {
+        const hint = `${order.indexOf(at) + 1}/${rows.length} · ${keys}`
+        return bodyRows >= 12 ? chunk(hint, cols - 1) : bodyRows >= 6 ? [fit(hint, cols - 1)] : []
+      }
+      const plainKeys = '↑↓ move · Enter open · Esc back'
+      // The box is sized for the longest hint it may show; both text hints are 45 cells, so Tab between tree and
+      // preview never changes the hint's rows and with them the box.
+      const hintN = hintOf(text ? '↑↓ move · Enter open · Tab preview · Esc back' : plainKeys).length
       // The box takes up to 60% and leaves the tree three rows (one in a small pane); title and border are its least.
-      const avail = bodyRows - hintRows.length
+      const avail = bodyRows - hintN
       const maxBox = Math.max(3, Math.min(avail - (avail >= 10 ? 3 : 1), Math.max(4, Math.floor(bodyRows * 0.6))))
 
       // Line numbers take the gutter; the rest of the box's inner width (cols - 4) holds the wrapped rows, less a
       // column for the scrollbar when the file is taller than the box.
       const gutterW = made.gutter ? String(made.lines.length).length + 1 : 0
       const fullW = Math.max(1, cols - 4 - gutterW)
-      const rowsAt = (w: number) => {
-        const got = wraps.get(`${sig}|${w}`) ?? layoutText(made, w)
-        if (made.lines.length) remember(wraps, `${sig}|${w}`, got, 3)
-        return got
-      }
-      // Every line takes a row at least, so only a short file needs laying out to know it fits.
-      const bar = textShown && fullW > 1 && (made.lines.length > maxBox - 3 || rowsAt(fullW).length > maxBox - 3)
+      const tall = text && overflows(made, fullW, maxBox - 3, sig)
+      // The bar needs three cells to say top, middle and end, and a desktop draws each plain Button as a native button.
+      const bar = tall && fullW > 1 && maxBox - 3 - (maxBox >= 6 && cols >= 20 ? 1 : 0) >= 3 && e.surface === 'terminal'
       const lineW = bar ? fullW - 1 : fullW
-      const textRows = rowsAt(lineW)
+      const wrapKey = `${sig}|${lineW}`
+      const textRows = wraps.get(wrapKey) ?? layoutText(made, lineW)
+      if (made.lines.length) remember(wraps, wrapKey, textRows, 2)
+      // A surface too narrow for a box leaves the mode to the one showing it.
+      if (boxed || !chosen) scrollable = tall
+      if (!scrollable) inPreview = false
+      const keys = !tall ? plainKeys : inPreview ? '↑↓ scroll · Enter close · Tab tree · Esc back' : '↑↓ move · Enter open · Tab preview · Esc back'
+      const hintRows = hintOf(keys)
+      while (hintRows.length < hintN) hintRows.push(' ')
 
       const pathRows = chunk(cleanName(real), cols - 6)
       const headline = `${isImage ? (dim ? `${dim.w} × ${dim.h} px` : imaging.has(imgKey) ? 'measuring…' : 'size unknown') : opaque}${st && st.kind === 'file' ? `  ·  ${human(st.size)}` : ''}`
@@ -691,7 +721,12 @@ export const register: Register = on => {
         g.pTop = to
         inPreview = true
         await update($, tick, n => n + 1)
-        void $.ui.focus({ requestId: PANE, key: 'close-preview' }).catch(() => undefined)
+        // Refused while the pane does not hold the keys: then there are none to put in the preview.
+        const r = await $.ui.focus({ requestId: PANE, key: 'close-preview' }).catch(() => undefined)
+        if (r?.deny && inPreview) {
+          inPreview = false
+          await update($, tick, n => n + 1)
+        }
       }
       // The thumb's length is the share of the file in view, its place the share above it; a cell pressed opens the file
       // that far down.
