@@ -1,7 +1,21 @@
 {
   "name": "file-tree",
-  "version": "0.1.0",
+  "displayName": "File Tree",
+  "version": "0.2.0",
   "description": "A project file tree pane inside Claude Code, the same in every terminal.",
+  "author": {
+    "name": "Kamal Raydan"
+  },
+  "homepage": "https://github.com/Aristere/termichy",
+  "repository": "https://github.com/Aristere/termichy",
+  "license": "MIT",
+  "keywords": [
+    "file-tree",
+    "files",
+    "pane",
+    "preview",
+    "mod"
+  ],
   "types": "./types/index.d.ts",
   "userConfig": {
     "width": {

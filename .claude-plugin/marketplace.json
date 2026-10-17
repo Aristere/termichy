@@ -1,0 +1,13 @@
+{
+  "name": "termichy",
+  "owner": {
+    "name": "Aristere"
+  },
+  "plugins": [
+    {
+      "name": "file-tree",
+      "source": "./",
+      "description": "A project file tree pane inside Claude Code, the same in every terminal."
+    }
+  ]
+}
