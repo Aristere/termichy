@@ -1313,3 +1313,66 @@ describe('code preview', () => {
     expect((await read()).range).toMatch(/^1-\d+\/1000$/)
   })
 })
+
+// Re-audit of 8adc96b: each test names a bug still there.
+describe('round 5', () => {
+  // How the box draws its lines: each run as code (through Code), comment (dim Text) or plain (Text).
+  const runsOf = (box: El | undefined) => {
+    const row = box ? all(box).find(e => e.type === 'Box' && e.props?.flexDirection === 'row' && !all(e).some(k => k.props?.key === 'jump-top')) : undefined
+    const kids = (row?.children ?? []).filter(isEl)
+    return (kids[kids.length - 1]?.children ?? []).filter(isEl).map(r => [r.type === 'Code' ? 'code' : r.props?.dimColor ? 'comment' : 'plain', (r.type === 'Code' ? String(r.props?.source ?? '') : textOf(r)).split('\n').length])
+  }
+  const show = async ($: Engine, on: On, name: string, text: string) => {
+    install(on, { [name]: file(text) })
+    const { ui, read } = await open($, 80, 30)
+    await ui.press({ key: K(name) })
+    return runsOf((await read()).box)
+  }
+
+  test('a regex literal holding "/*" does not grey out the code after it', async ($, on) => {
+    // `/\/*$/` trims trailing slashes; the scanner takes its "/*" for a block comment that never closes.
+    const runs = await show($, on, 'trim.ts', "const trim = (s: string) => s.replace(/\\/*$/, '')\nexport const a = 1\nexport const b = 2")
+    expect(runs).toEqual([['code', 3]])
+  })
+
+  test('a regex literal holding a backtick does not turn the code after it into a string', async ($, on) => {
+    // Markdown escaping: the backtick in the character class opens a template literal that never closes.
+    const runs = await show($, on, 'md.ts', "const esc = (s: string) => s.replace(/[`*_]/g, '\\\\$&')\nexport const a = 1\nexport const b = 2")
+    expect(runs).toEqual([['code', 3]])
+  })
+
+  test('a Go raw string ending in a backslash closes there', async ($, on) => {
+    // Raw strings have no escapes; the scanner skips the closing backtick after the backslash.
+    const runs = await show($, on, 'p.go', 'package main\n\nconst sep = `\\`\n\nfunc main() {}\nfunc other() {}')
+    expect(runs).toEqual([['code', 6]])
+  })
+
+  test('in CSS, "//" in an unquoted url() does not hide a block comment opened after it', async ($, on) => {
+    // "//" is no comment in CSS; breaking there misses the "/*" that follows, so the comment's next line is coloured as code.
+    const runs = await show($, on, 's.css', 'a { background: url(//cdn.example/x.png); } /* note\n   still the comment\n*/\nb { color: red; }')
+    expect(runs).toEqual([['code', 1], ['comment', 2], ['code', 1]])
+  })
+
+  test('a tall box of long lines keeps its footer and every line (a drawing is cut at 100,000 characters)', { timeoutMs: 30000 }, async ($, on) => {
+    // 300 lines of 1,000 characters: each is under the per-line cap, but a 200-row pane hands 116 of them to Code
+    // whole. The engine cuts the drawing at 100,000 characters: the source ends "… N more" and the footer is dropped,
+    // while the gutter still numbers the rows that were cut.
+    install(on, { 'rows.txt': file(Array.from({ length: 300 }, (_, i) => `${i}:`.padEnd(1000, 'x')).join('\n')) })
+    const { ui, read } = await open($, 80, 200)
+    await ui.press({ key: K('rows.txt') })
+    const v = await read()
+    expect(v.box, 'the box is drawn').toBeDefined()
+    const src = all(v.top).filter(e => e.type === 'Code').map(e => String(e.props?.source ?? '')).join('\n').split('\n')
+    expect(src[src.length - 1] ?? '', 'last line drawn').not.toMatch(/more$/)
+    expect(v.footer, 'footer drawn').toBe(true)
+  })
+
+  test('a file cut at 4 MiB says so in a short pane, where no footer is drawn', { timeoutMs: 20000 }, async ($, on) => {
+    install(on, { 'over.txt': file(('y'.repeat(63) + '\n').repeat(65536) + 'z') })
+    const { ui, read } = await open($, 40, 9)
+    await ui.press({ key: K('over.txt') })
+    const v = await read()
+    expect(v.box).toBeDefined()
+    expect(v.boxText ?? '', 'the cut is mentioned somewhere in the box').toMatch(/cut|first/)
+  })
+})
