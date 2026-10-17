@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `file-tree` is a Claude Code plugin (a "mod") that opens a project file tree and file preview in a pane. It is not a Node package: there is no `package.json`, no bundler and no build step. Claude Code loads `hooks/register.tsx` directly, via `hooks/hooks.json` (`{ "modules": ["./register.tsx"] }`).
 
+Tracked files: `CLAUDE.md`, `README.md`, `LICENSE`, `hooks/`, `tests/`, `types/`, `tsconfig.json`, `.gitignore`, `.github/workflows/ci.yml` and `.claude-plugin/plugin.json` plus `marketplace.json`. `.claude/` (agent worktrees) is ignored. The repo is its own marketplace (`.claude-plugin/marketplace.json`); bump `version` in `plugin.json` on every release or installed copies will not update.
+
 There are no fixtures in the repo. To try the pane by hand, build a scratch folder outside it with many files, deep folders, a very long name, CJK/emoji names, a symlink and a dangling one, a `chmod 000` file, a >4 MiB text file, a binary, a png/jpg, an mp4 and a fifo.
 
 ## Commands

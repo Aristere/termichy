@@ -6,6 +6,10 @@ A project file tree and file preview in a pane inside Claude Code.
 - Selecting a file previews it: text with line numbers and a scrollbar, images (macOS), and a summary for other files.
 - The pane stays closed until you ask for it.
 
+## Requirements
+
+Claude Code 2.1.302 or later (the version it was tested on). It uses the mods interface, which older versions lack.
+
 ## Install
 
 ```

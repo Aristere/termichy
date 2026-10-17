@@ -396,7 +396,7 @@ type Reader = {
 }
 const settings = async ($: Reader) => {
   const rows = await $.config.list().catch(() => [])
-  const saved = await $.settings.read().then(x => x.pluginConfigs ?? {}, () => ({}))
+  const saved: Record<string, { options?: Record<string, unknown> }> = await $.settings.read().then(x => x.pluginConfigs ?? {}, () => ({}))
   const key = Object.keys(saved).find(k => k === 'file-tree' || k.startsWith('file-tree@'))
   const own = key ? saved[key]?.options : undefined
   const value = (name: string) => rows.find(r => r.key === `file-tree.${name}`)?.value ?? own?.[name]
@@ -486,7 +486,7 @@ export const register: Register = on => {
     await update($, cursor, () => at).catch(() => undefined)
     focusCursor($)
     return {}
-  })
+  }).catch(async (_$, e, next) => next(e)) // fail open: a failed observer passes the event on
 
   // Tab and clicks move the engine's focus ring; the cursor follows it onto a row, so Enter and › agree.
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
@@ -525,14 +525,14 @@ export const register: Register = on => {
       await update($, cursor, () => at).catch(() => undefined)
     }
     return r
-  })
+  }).catch(async (_$, e, next) => next(e)) // fail open: a failed observer passes the event on
 
   // Redraw after any tool that can add, rename or delete files.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
     await update($, tick, n => n + 1).catch(() => undefined)
     return ran
-  })
+  }).catch(async (_$, e, next) => next(e)) // fail open: a failed observer passes the event on
 
   on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => {
     const turn = drawing.then(() => draw())
