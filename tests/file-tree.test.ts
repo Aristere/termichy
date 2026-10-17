@@ -1878,4 +1878,37 @@ describe('round 9', () => {
     await tab($, K('z.txt'))
     expect((await read()).cursor).toBe('z.txt')
   })
+
+  // Audit of 0e8910a.
+  for (const order of ['desktop last', 'terminal last'] as const) {
+    test(`a surface where the file fits leaves the preview mode of one where it scrolls (${order})`, async ($, on) => {
+      ring(on)
+      install(on, { 'a.txt': file(), 'n.txt': file(Array.from({ length: 20 }, (_, i) => `row ${i + 1}`).join('\n')), 'z.txt': file() })
+      const rows = 20
+      const two = order === 'terminal last' ? await open($, 50, 60, 'desktop') : undefined
+      const one = await open($, 50, rows)
+      await one.ui.press({ key: K('n.txt') })
+      const desk = two ?? (await open($, 50, 60, 'desktop'))
+      await desk.read()
+      await one.read()
+      await tab($, K('z.txt'))
+      await desk.read()
+      await scroll($, 1, rows)
+      const v = await one.read()
+      expect(v.cursor).toBe('n.txt')
+      expect(v.range).toMatch(/^2-/)
+    })
+  }
+
+  test('the thumb lands on the cell pressed for every cell of a 23-cell bar', async ($, on) => {
+    install(on, { 'n.txt': file(Array.from({ length: 353 }, (_, i) => `r${i + 1}`).join('\n')) })
+    const { ui, read } = await open($, 50, 45)
+    await ui.press({ key: K('n.txt') })
+    const n = bar((await read()).box).length
+    expect(n).toBe(23)
+    for (let i = 0; i < n; i++) {
+      await ui.press({ key: `sb-${i}` })
+      expect(bar((await read()).box).indexOf('█'), `cell ${i}`).toBe(i)
+    }
+  })
 })

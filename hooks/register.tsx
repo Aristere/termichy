@@ -26,6 +26,8 @@ type Geo = {
   page: number
   previewFrom: number
   anchor?: { sig: string; width: number; line: number; at: number }
+  // Its box holds a text taller than itself.
+  tall?: boolean
 }
 const geos = new Map<string, Geo>()
 // Tab from the tree puts the arrows, Home/End and the wheel on the text preview, with the ring resting on the box's
@@ -375,14 +377,14 @@ type Stat = { kind: 'file' | 'dir' | 'other'; size: number; mtimeMs: number; isL
 // Focus calls run in order and each names the cursor as it is by then, so a burst of wheel ticks ends on the last row.
 // A ring move that came first denies one; it is tried again, since Enter presses whatever holds the ring.
 let focusing: Promise<unknown> = Promise.resolve()
-const focusRing = ($: any, key: () => string) => {
+// The key is read when the move runs, from the mode as it is by then, so a move queued before a Tab never undoes it.
+const focusCursor = ($: any) => {
   focusing = focusing
     .then(async () => {
-      for (let i = 0; i < 3; i++) if (!(await $.ui.focus({ requestId: PANE, key: key() }))?.deny) break
+      for (let i = 0; i < 3; i++) if (!(await $.ui.focus({ requestId: PANE, key: inPreview ? 'close-preview' : rowKey(at) }))?.deny) break
     })
     .catch(() => undefined)
 }
-const focusCursor = ($: any) => focusRing($, () => rowKey(at))
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -420,7 +422,7 @@ export const register: Register = on => {
       }
       await update($, tick, n => n + 1).catch(() => undefined)
       // Back from Esc the pane draws no ring until something moves it, and Enter would press nothing.
-      if (inPreview && !e.pointer) focusRing($, () => 'close-preview')
+      if (inPreview && !e.pointer) focusCursor($)
       return {}
     }
     if (order.length === 0) return {}
@@ -624,7 +626,9 @@ export const register: Register = on => {
       const textRows = wraps.get(wrapKey) ?? layoutText(made, lineW)
       if (made.lines.length) remember(wraps, wrapKey, textRows, 2)
       // A surface too narrow for a box leaves the mode to the one showing it.
-      if (boxed || !chosen) scrollable = tall
+      // Each surface says whether its own box scrolls; one too narrow for a box leaves its last word.
+      if (boxed || !chosen) g.tall = tall
+      scrollable = [...geos.values()].some(x => x.tall)
       if (!scrollable) inPreview = false
       const keys = !tall ? plainKeys : inPreview ? '↑↓ scroll · Enter close · Tab tree · Esc back' : '↑↓ move · Enter open · Tab preview · Esc back'
       const hintRows = hintOf(keys)
@@ -691,6 +695,7 @@ export const register: Register = on => {
 
       // The close button unmounts with the box and the engine hands its focus to whichever row now sits there; put it back on the cursor.
       const closePreview = async () => {
+        inPreview = false
         await update($, selected, () => '')
         focusCursor($)
       }
@@ -742,8 +747,9 @@ export const register: Register = on => {
       // that far down.
       const thumb = Math.max(1, Math.round((previewRoom * previewRoom) / Math.max(1, textRows.length)))
       // Rounded down, and a press rounded up, so the thumb takes the last cell only at the end and sits on the cell pressed.
-      const thumbAt = pMax ? Math.floor((pTop / pMax) * (previewRoom - thumb)) : 0
-      const cellTo = (i: number) => Math.ceil((i / Math.max(1, previewRoom - 1)) * pMax)
+      // Products before quotients: 15 / 22 * 330 is 224.99999999999997, and the thumb lit the cell above.
+      const thumbAt = pMax ? Math.floor((pTop * (previewRoom - thumb)) / pMax) : 0
+      const cellTo = (i: number) => Math.ceil((i * pMax) / Math.max(1, previewRoom - 1))
       // The title button's label gets cols - 8 cells: the title, a space, then "(press to close)" (16), which a narrow
       // box drops before the title would wrap.
       const closeHint = cols - 9 - 16 >= 6
