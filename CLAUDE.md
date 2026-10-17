@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `file-tree` is a Claude Code plugin (a "mod") that opens a project file tree and file preview in a pane. It is not a Node package: there is no `package.json`, no bundler and no build step. Claude Code loads `hooks/register.tsx` directly, via `hooks/hooks.json` (`{ "modules": ["./register.tsx"] }`).
 
-Tracked files: `CLAUDE.md`, `README.md`, `LICENSE`, `hooks/`, `tests/`, `types/`, `tsconfig.json`, `.gitignore`, `.github/workflows/ci.yml` and `.claude-plugin/plugin.json` plus `marketplace.json`. `.claude/` (agent worktrees) is ignored. The repo is its own marketplace (`.claude-plugin/marketplace.json`); bump `version` in `plugin.json` on every release or installed copies will not update.
+Tracked files: `CLAUDE.md`, `README.md`, `LICENSE`, `assets/` (demo GIF and the `icon` that `plugin.json` points at for the directory listing), `hooks/`, `tests/`, `types/`, `tsconfig.json`, `.gitignore`, `.github/workflows/ci.yml` and `.claude-plugin/plugin.json` plus `marketplace.json`. `.claude/` (agent worktrees) is ignored. The repo is its own marketplace (`.claude-plugin/marketplace.json`); bump `version` in `plugin.json` on every release or installed copies will not update.
 
 There are no fixtures in the repo. To try the pane by hand, build a scratch folder outside it with many files, deep folders, a very long name, CJK/emoji names, a symlink and a dangling one, a `chmod 000` file, a >4 MiB text file, a binary, a png/jpg, an mp4 and a fifo.
 
@@ -51,6 +51,16 @@ Preview rules in `loadText` and the render body:
 - Row buttons are keyed with `rowKey` (`encodeURIComponent` of the path, with lone surrogates spelled out first because `encodeURIComponent` throws on them) so names never collide with fixed button keys like `close-preview`.
 - OS refusals come back from the engine as text with no `code`; `errno` pulls the `E…` token (for example `EACCES`) out of the message for the box.
 - The cursor row is underlined as well as marked with `›`. The engine inverts whichever row rests under the mouse pointer (hover) and re-applies it after every relayout, so after closing a preview the highlight lands on the row now under a stationary pointer while the cursor stays put. That is the engine's behaviour and no `$.ui.focus` call changes it; the underline is what keeps the real cursor readable.
+
+## Directory submission
+
+The plugin is submitted to Anthropic's directory through claude.ai/directory/manage (Plugin bundle, repo `Aristere/termichy`); the portal's Validate runs on the pushed commit, so push before re-validating. Its static scan of `hooks/register.tsx` blocks on patterns that `claude plugin validate` and the tests accept:
+
+- Never name a variable, parameter or property `h` or `Fragment` (the JSX factory names), nor re-bind `e` or `$` anywhere in the file (the `command.run` hook takes `$, e`): the scan can then no longer tell what the hook does with its event.
+- `$.config.set({ key: 'literal', value })` must be written inside a hook, one object with a fixed key. A helper or a loop over keys is blocked.
+- The icon is `assets/icon.png` (square PNG, 512 px minimum, under 2 MB; SVG and WebP are refused). The portal takes it only on the first save or submission.
+- The README's "Data" section answers the policy holds (what runs, what is set, what is hooked). Update it when a hook, a `process.run` command or a setting is added.
+- Expected policy holds that a reviewer clears: `process.run` beside `fs.read`, `command.run` not calling `next(e)`, `config.set`.
 
 ## Tests
 

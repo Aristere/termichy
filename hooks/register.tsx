@@ -55,7 +55,7 @@ const OPAQUE = new Set([
   'pages', 'numbers', 'key', 'psd', 'sketch', 'fig', 'sqlite', 'db', 'exe', 'bin', 'woff', 'woff2', 'ttf', 'otf',
 ])
 // Keyed by path, mtime and size, so a file rewritten on disk is measured and read again; each keeps its newest few.
-const sizes = new Map<string, { w: number; h: number } | null>()
+const sizes = new Map<string, { w: number; tall: number } | null>()
 // A PNG is up to 2.7 MB of base64, so only the last few previewed stay.
 const pngs = new Map<string, string | null>()
 // The lines of the previewed file and the mode each starts in, so a wheel tick slices them instead of re-reading
@@ -79,11 +79,11 @@ const REGEX_WORDS = new Set('return typeof case do else in of new delete void th
 const kindOf = (mode: string): Kind => (mode === '*/' ? 1 : mode ? 2 : 0)
 // Scans one line from the mode it starts in ('' code, '*/', '`', '"""', "'''"): the mode it ends in, and the kind at each
 // of `stops` (ascending offsets into the line).
-const scan = (line: string, start: string, e: string, stops: number[] = []) => {
-  const c = C_LIKE.has(e)
-  const js = JS.has(e)
-  const go = e === 'go'
-  const py = e === 'py'
+const scan = (line: string, start: string, lang: string, stops: number[] = []) => {
+  const c = C_LIKE.has(lang)
+  const js = JS.has(lang)
+  const go = lang === 'go'
+  const py = lang === 'py'
   const at: Kind[] = []
   let mode = start
   let q = ''
@@ -106,7 +106,7 @@ const scan = (line: string, start: string, e: string, stops: number[] = []) => {
     } else if (q) {
       if (ch === '\\') i++
       else if (ch === q) (q = ''), (prev = ch)
-    } else if ((c && e !== 'css' && line.startsWith('//', i)) || (py && ch === '#')) {
+    } else if ((c && lang !== 'css' && line.startsWith('//', i)) || (py && ch === '#')) {
       comment = true
       break
     } else if (js && ch === '/' && line[i + 1] !== '*' && (prev === '' || REGEX_PREV.includes(prev) || REGEX_WORDS.has(word))) {
@@ -326,8 +326,8 @@ const rowKey = (path: string) =>
 
 // The engine wraps an OS refusal in its own prefix and sets no `code`; the errno is the E-token in the message.
 const errno = (err: unknown) => {
-  const e = err as { code?: string; message?: string }
-  const msg = String(e?.code ?? e?.message ?? '')
+  const info = err as { code?: string; message?: string }
+  const msg = String(info?.code ?? info?.message ?? '')
   return msg.match(/\bE[A-Z0-9]{3,}\b[^,'()\n]*/)?.[0] ?? ''
 }
 
@@ -341,8 +341,8 @@ const measure = ($: any, key: string, arg: string, withPng: boolean) => {
     if (!sizes.has(key)) {
       const out = await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', arg], { timeoutMs: 5000 }).catch(() => undefined)
       const w = Number(out?.stdout.match(/pixelWidth:\s*(\d+)/)?.[1])
-      const h = Number(out?.stdout.match(/pixelHeight:\s*(\d+)/)?.[1])
-      remember(sizes, key, w && h ? { w, h } : null, 256)
+      const tall = Number(out?.stdout.match(/pixelHeight:\s*(\d+)/)?.[1])
+      remember(sizes, key, w && tall ? { w, tall } : null, 256)
     }
     // Real pixels via the terminal's own image support; sips makes a PNG, shrunk until it fits the 2 MiB the Image takes.
     if (withPng && sizes.get(key) && !pngs.has(key)) {
@@ -371,7 +371,7 @@ const measure = ($: any, key: string, arg: string, withPng: boolean) => {
 }
 
 const pathOf = (key: string) =>
-  key.startsWith('r:') ? decodeURIComponent(key.slice(2)).replace(/\ufffe([0-9a-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))) : undefined
+  key.startsWith('r:') ? decodeURIComponent(key.slice(2)).replace(/\ufffe([0-9a-f]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16))) : undefined
 
 type Row = { path: string; name: string; depth: number; isDir: boolean; lines: string[]; width: number }
 type Stat = { kind: 'file' | 'dir' | 'other'; size: number; mtimeMs: number; isLink: boolean; realPath?: string }
@@ -414,16 +414,12 @@ const AUTO = 'Open it automatically'
 const MANUAL = 'Only when I ask (/tree)'
 type Asker = Reader & {
   ui: { ask: (q: string, o: { options: readonly string[]; header: string }) => Promise<string> }
-  config: { set: (a: { key: string; value: string | number | boolean }) => Promise<{ deny?: string }> }
 }
-const setup = async ($: Asker) => {
+// "Other" free text matches no label, so that setting comes back undefined and keeps its current value.
+const choose = async ($: Asker) => {
   const wide = await $.ui.ask('How wide should the file tree be?', { options: Object.keys(WIDTHS), header: 'Width' })
   const auto = await $.ui.ask('When should the file tree open?', { options: [AUTO, MANUAL], header: 'Opening' })
-  const columns = WIDTHS[wide as keyof typeof WIDTHS]
-  // "Other" free text matches no label and keeps the current value.
-  const writes = [...(columns ? [{ key: 'file-tree.width', value: columns }] : []), ...(auto === AUTO || auto === MANUAL ? [{ key: 'file-tree.openOnStart', value: auto === AUTO }] : [])]
-  for (const w of writes) if ((await $.config.set(w)).deny) return false
-  return true
+  return { columns: WIDTHS[wide as keyof typeof WIDTHS] as number | undefined, open: auto === AUTO ? true : auto === MANUAL ? false : undefined }
 }
 
 export const register: Register = on => {
@@ -442,7 +438,15 @@ export const register: Register = on => {
     let note = ''
     if (arg === 'setup') {
       // A dismissed question rejects; nothing is saved then.
-      note = await setup($).then(ok => (ok ? 'Saved.' : 'Could not save the choices.'), () => 'Setup skipped.')
+      try {
+        const pick = await choose($)
+        let ok = true
+        if (pick.columns !== undefined) ok = !(await $.config.set({ key: 'file-tree.width', value: pick.columns })).deny
+        if (ok && pick.open !== undefined) ok = !(await $.config.set({ key: 'file-tree.openOnStart', value: pick.open })).deny
+        note = ok ? 'Saved.' : 'Could not save the choices.'
+      } catch {
+        note = 'Setup skipped.'
+      }
     } else if (!(await settings($)).asked && !(await $.store.get('tipShown'))) {
       // It works on the defaults; the tip is shown once.
       note = 'Tip: /tree setup lets you change its width and when it opens.'
@@ -691,7 +695,7 @@ export const register: Register = on => {
       while (hintRows.length < hintN) hintRows.push(' ')
 
       const pathRows = chunk(cleanName(real), cols - 6)
-      const headline = `${isImage ? (dim ? `${dim.w} × ${dim.h} px` : imaging.has(imgKey) ? 'measuring…' : 'size unknown') : opaque}${st && st.kind === 'file' ? `  ·  ${human(st.size)}` : ''}`
+      const headline = `${isImage ? (dim ? `${dim.w} × ${dim.tall} px` : imaging.has(imgKey) ? 'measuring…' : 'size unknown') : opaque}${st && st.kind === 'file' ? `  ·  ${human(st.size)}` : ''}`
       const headRows = chunk(headline, cols - 6)
       const imgCols = Math.max(8, Math.min(80, cols - 6))
       const drawImg = !!(isImage && dim && png && Image)
@@ -707,7 +711,7 @@ export const register: Register = on => {
       room -= headShown.length - head1
       const pathShown = clip(pathRows, room, cols - 6)
       room -= pathShown.length
-      const imgRows = drawImg && dim ? Math.min(room, 255, Math.max(1, Math.round((imgCols * dim.h) / dim.w / 2))) : 0
+      const imgRows = drawImg && dim ? Math.min(room, 255, Math.max(1, Math.round((imgCols * dim.tall) / dim.w / 2))) : 0
       const textBox = Math.min(maxBox, textRows.length + 3)
       const boxRows = !boxed ? 0 : isImage || opaque ? 3 + buttons + headShown.length + pathShown.length + imgRows : textBox
       // A long text gets a footer row for the jump buttons: a wheel tick moves a few rows, too slow to cross a big file.
@@ -964,12 +968,12 @@ async function loadText($: any, path: string, st: Stat | undefined, statErr: str
   const lines = text.replace(/\r\n/g, '\n').split('\n')
   if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop()
   const rows = lines.map(l => clean(l.replace(/\t/g, '  ')))
-  const e = ext(path)
+  const lang = ext(path)
   const modes: string[] = []
   let mode = ''
   for (const line of rows) {
     modes.push(mode)
-    mode = scan(line, mode, e).mode
+    mode = scan(line, mode, lang).mode
   }
-  return { lines: rows, modes, ext: e, opaque: '', cut, gutter: true }
+  return { lines: rows, modes, ext: lang, opaque: '', cut, gutter: true }
 }

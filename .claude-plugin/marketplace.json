@@ -3,6 +3,7 @@
   "owner": {
     "name": "Aristere"
   },
+  "description": "Plugins for Claude Code by Aristere.",
   "plugins": [
     {
       "name": "file-tree",

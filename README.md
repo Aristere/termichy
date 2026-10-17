@@ -45,6 +45,19 @@ The defaults work, so setup is optional. Run `/tree setup` to answer two questio
 
 Your answers are kept for every session and project. Run `/tree setup` again to change them. The same two settings are in `/config`, under "Pane width" and "Open on session start".
 
+## Data
+
+The plugin makes no network requests and sends nothing anywhere. It reads files under the folder you opened to draw the tree and the preview, and it runs `sips` (images, macOS only), `head` (large text files) and `open`, `xdg-open` or `explorer` (the open and reveal buttons) on your machine. It never writes to your project.
+
+What it hooks and sets:
+
+- `command.run` for `/tree` only. It opens the pane and handles `/tree setup`. It does not touch any other command or any permission prompt.
+- `tool.call`, only to redraw the tree after a tool may have changed files. It reads no tool input or output and passes every call on unchanged.
+- `/tree setup` writes two plugin settings with `config.set`: `file-tree.width` and `file-tree.openOnStart`. Nothing else is set, and no environment variables.
+- It reads no credentials. The only user-level file it names is `~/.claude.json`, which the engine itself uses to remember a dragged pane width.
+
+It stores three things locally: your two setup answers (in `~/.claude/settings.json`), a flag that the first-run tip was shown (in `~/.claude/plugins/store/`), and the pane width if you drag it (in `~/.claude.json`).
+
 ## Requirements
 
 Claude Code 2.1.302 or later. The pane docks beside the conversation in a terminal at least 110 columns wide.
