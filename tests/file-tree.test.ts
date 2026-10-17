@@ -1819,4 +1819,63 @@ describe('round 9', () => {
     console.log(`minified on two surfaces, ms per tick ${times.join(' ')}`)
     expect(Math.max(...times)).toBeLessThan(50)
   })
+
+  // End-user test of 25bcc25.
+  test('Tab from the title toward one of the engine stops goes back to the tree, not onto the stop', async ($, on) => {
+    ring(on)
+    install(on, { 'a.txt': file(), 'n.txt': long(), 'z.txt': file() })
+    const rows = 7
+    const { ui, read } = await open($, 40, rows)
+    await ui.press({ key: K('n.txt') })
+    await tab($, K('z.txt'))
+    expect((await read()).hint).toContain('↑↓ scroll')
+    // No bar or footer at 7 rows: the next stop after the title is the pane's own close mark.
+    const r = await $.ui.focus({ component: 'Pane', requestId: PANE, origin: { kind: 'person' } })
+    expect(r).toEqual({})
+    await scroll($, 1, rows)
+    const v = await read()
+    expect(v.hint).not.toContain('↑↓ scroll')
+    expect(v.cursor).toBe('z.txt')
+  })
+
+  test('Tab onto any row (the first, when no ring is drawn) goes into a preview that scrolls', async ($, on) => {
+    ring(on)
+    const many = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`f${i}.txt`, file()]))
+    install(on, { ...many, 'n.txt': long() })
+    const { ui, read } = await open($, 50, 30)
+    await ui.press({ key: K('n.txt') })
+    await tab($, K('f0.txt'))
+    const v = await read()
+    expect(v.hint).toContain('↑↓ scroll')
+    expect(v.cursor).toBe('n.txt')
+  })
+
+  test('the thumb takes the last cell only at the end, and sits on the cell pressed', async ($, on) => {
+    install(on, { 'n.txt': file(Array.from({ length: 5000 }, (_, i) => `row ${i + 1}`).join('\n')) })
+    const rows = 30
+    const { ui, read } = await open($, 50, rows)
+    await ui.press({ key: K('n.txt') })
+    await ui.press({ key: 'jump-end' })
+    await scroll($, -1, rows)
+    const v = await read()
+    expect(v.range).toMatch(/-4999\/5000$/)
+    let cells = bar(v.box)
+    expect(cells.at(-1)).toBe('│')
+    for (const i of [1, 5, 9, cells.length - 2]) {
+      await ui.press({ key: `sb-${i}` })
+      cells = bar((await read()).box)
+      expect(cells.indexOf('█'), `cell ${i}`).toBe(i)
+    }
+  })
+
+  test('a box with no room for text keeps Tab in the tree', async ($, on) => {
+    ring(on)
+    install(on, { 'a.txt': file(), 'n.txt': long(), 'z.txt': file() })
+    const rows = 4
+    const { ui, read } = await open($, 40, rows)
+    await ui.press({ key: K('n.txt') })
+    expect((await read()).codeLines).toBe(0)
+    await tab($, K('z.txt'))
+    expect((await read()).cursor).toBe('z.txt')
+  })
 })

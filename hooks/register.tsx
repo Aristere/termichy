@@ -375,13 +375,14 @@ type Stat = { kind: 'file' | 'dir' | 'other'; size: number; mtimeMs: number; isL
 // Focus calls run in order and each names the cursor as it is by then, so a burst of wheel ticks ends on the last row.
 // A ring move that came first denies one; it is tried again, since Enter presses whatever holds the ring.
 let focusing: Promise<unknown> = Promise.resolve()
-const focusCursor = ($: any) => {
+const focusRing = ($: any, key: () => string) => {
   focusing = focusing
     .then(async () => {
-      for (let i = 0; i < 3; i++) if (!(await $.ui.focus({ requestId: PANE, key: rowKey(at) }))?.deny) break
+      for (let i = 0; i < 3; i++) if (!(await $.ui.focus({ requestId: PANE, key: key() }))?.deny) break
     })
     .catch(() => undefined)
 }
+const focusCursor = ($: any) => focusRing($, () => rowKey(at))
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -418,6 +419,8 @@ export const register: Register = on => {
         x.pTop = Math.max(0, Math.min(x.pMax, x.pTop + step))
       }
       await update($, tick, n => n + 1).catch(() => undefined)
+      // Back from Esc the pane draws no ring until something moves it, and Enter would press nothing.
+      if (inPreview && !e.pointer) focusRing($, () => 'close-preview')
       return {}
     }
     if (order.length === 0) return {}
@@ -443,10 +446,15 @@ export const register: Register = on => {
       if (!r.deny) into(el === 'close-preview')
       return r
     }
-    // The event cannot tell Tab from a click, so a move to the row next to the cursor, or onto the box, is taken for
-    // Tab; a click there still presses what it hit, and the row and box presses put the keys where they belong.
-    const near = (p?: string) => p !== undefined && order.includes(p) && Math.abs(order.indexOf(p) - order.indexOf(at)) === 1
-    if ((!inPreview && scrollable && (isPreviewKey(el) || near(pathOf(el)))) || (inPreview && el !== 'close-preview')) {
+    // The ring moves by Tab here (a click presses without moving it), so every move from the tree goes into a
+    // preview that scrolls, and every move from the title goes back. A move to one of the engine's stops cannot be
+    // sent elsewhere (next() refuses an element there), so it is kept from happening and the ring goes back itself.
+    if (inPreview && !e.element) {
+      into(false)
+      focusCursor($)
+      return {}
+    }
+    if ((!inPreview && scrollable && (isPreviewKey(el) || pathOf(el) !== undefined)) || (inPreview && el !== 'close-preview')) {
       const entering = !inPreview
       const r = await next({ ...e, element: entering ? 'close-preview' : rowKey(at) })
       if (!r.deny) into(entering)
@@ -606,9 +614,11 @@ export const register: Register = on => {
       // column for the scrollbar when the file is taller than the box.
       const gutterW = made.gutter ? String(made.lines.length).length + 1 : 0
       const fullW = Math.max(1, cols - 4 - gutterW)
-      const tall = text && overflows(made, fullW, maxBox - 3, sig)
+      // A text taller than the box has these rows of it in view (the footer takes one), and in a tiny pane none.
+      const tallRoom = maxBox - 3 - (maxBox >= 6 && cols >= 20 ? 1 : 0)
+      const tall = text && tallRoom > 0 && overflows(made, fullW, maxBox - 3, sig)
       // The bar needs three cells to say top, middle and end, and a desktop draws each plain Button as a native button.
-      const bar = tall && fullW > 1 && maxBox - 3 - (maxBox >= 6 && cols >= 20 ? 1 : 0) >= 3 && e.surface === 'terminal'
+      const bar = tall && fullW > 1 && tallRoom >= 3 && e.surface === 'terminal'
       const lineW = bar ? fullW - 1 : fullW
       const wrapKey = `${sig}|${lineW}`
       const textRows = wraps.get(wrapKey) ?? layoutText(made, lineW)
@@ -731,8 +741,9 @@ export const register: Register = on => {
       // The thumb's length is the share of the file in view, its place the share above it; a cell pressed opens the file
       // that far down.
       const thumb = Math.max(1, Math.round((previewRoom * previewRoom) / Math.max(1, textRows.length)))
-      const thumbAt = pMax ? Math.round((pTop / pMax) * (previewRoom - thumb)) : 0
-      const cellTo = (i: number) => Math.round((i / Math.max(1, previewRoom - 1)) * pMax)
+      // Rounded down, and a press rounded up, so the thumb takes the last cell only at the end and sits on the cell pressed.
+      const thumbAt = pMax ? Math.floor((pTop / pMax) * (previewRoom - thumb)) : 0
+      const cellTo = (i: number) => Math.ceil((i / Math.max(1, previewRoom - 1)) * pMax)
       // The title button's label gets cols - 8 cells: the title, a space, then "(press to close)" (16), which a narrow
       // box drops before the title would wrap.
       const closeHint = cols - 9 - 16 >= 6
