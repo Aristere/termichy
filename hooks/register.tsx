@@ -457,9 +457,11 @@ export const register: Register = on => {
       return {}
     }
     if ((!inPreview && scrollable && (isPreviewKey(el) || pathOf(el) !== undefined)) || (inPreview && el !== 'close-preview')) {
+      // Switched before the move lands: an arrow handled while next() is pending would act in the old mode.
       const entering = !inPreview
+      into(entering)
       const r = await next({ ...e, element: entering ? 'close-preview' : rowKey(at) })
-      if (!r.deny) into(entering)
+      if (r.deny) into(!entering)
       return r
     }
     const r = await next(e)
