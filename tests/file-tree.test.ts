@@ -1538,3 +1538,43 @@ describe('round 6', () => {
     expect(Math.max(...times)).toBeLessThan(1000)
   })
 })
+
+// Audit of e1d230e (FE0F as one cell, cut-mark guard): these name bugs that diff introduced.
+describe('round 7', () => {
+  // A U+FE0F at the start of a line, or after the indent, has been cut from the emoji it belongs to.
+  const stranded = (lines: string[]) => lines.filter(l => /(^|\s)️/.test(l)).map(l => JSON.stringify(l))
+  const BIG = ('y'.repeat(63) + '\n').repeat(65536) + 'z'
+
+  test('a tree name never wraps between ❤ and its U+FE0F', async ($, on) => {
+    // At 20 columns a depth-0 name gets 13 cells: twelve letters and ❤ fill them, and FE0F (now one cell) wraps alone.
+    install(on, { 'abcdefghijkl❤️x.txt': file() })
+    const v = await (await open($, 20, 20)).read()
+    expect(stranded(v.rows.flatMap(r => r.label.split('\n')))).toEqual([])
+  })
+
+  test('a wrapped preview line never splits ❤ from its U+FE0F', async ($, on) => {
+    // 40 columns leave 34 cells beside a 2-cell gutter: 33 x's and ❤ fill row one, FE0F starts row two.
+    install(on, { 'h.txt': file('x'.repeat(33) + '❤️' + 'y'.repeat(10)) })
+    const { ui, read } = await open($, 40, 20)
+    await ui.press({ key: K('h.txt') })
+    expect(stranded(((await read()).source ?? '').split('\n'))).toEqual([])
+  })
+
+  test('a cut file with no footer keeps "· cut" in the title wherever it fits (16 and 33 columns)', { timeoutMs: 30000 }, async ($, on) => {
+    // The label has cols - 8 cells: at 16 "… · cut " is 8, at 33 "… · cut (press to close)" is 24 of 25, yet the guard drops the mark.
+    install(on, { 'over.txt': file(BIG) })
+    const bad: string[] = []
+    for (const [cols, rows] of [[16, 20], [33, 8]] as const) {
+      const { ui, read } = await open($, cols, 400)
+      await ui.press({ key: K('over.txt') })
+      await ui.redraw(props(cols, rows))
+      const v = await read()
+      const el = all(v.box ?? v.top).find(e => e.props?.key === 'close-preview')
+      const label = String(el?.props?.label ?? textOf(el))
+      if (v.footer) bad.push(`cols ${cols}: has a footer, test setup is wrong`)
+      else if (!label.includes('cut')) bad.push(`cols ${cols}: ${JSON.stringify(label)} (${width(label)} of ${cols - 8} cells) has no cut mark`)
+      await ui.unmount()
+    }
+    expect(bad).toEqual([])
+  })
+})
