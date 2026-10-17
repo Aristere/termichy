@@ -1075,7 +1075,8 @@ describe('re-audit', () => {
           if (h !== rows + 1) bad.push(`${pick || 'none'} ${cols}x${rows}: height ${h}`)
           for (const b of boxWidths(v.top, cols)) bad.push(`${pick || 'none'} ${cols}x${rows}: ${b}`)
         }
-        if (pick) await ui.press({ key: 'close-preview' })
+        // Under 14 columns no box is drawn, so there is nothing to close.
+        if (pick && (await read()).box) await ui.press({ key: 'close-preview' })
       }
       await ui.unmount()
     }
@@ -1118,4 +1119,94 @@ describe('re-audit', () => {
     // Its parent is the root, which is no row, so the fallback ends at order[0] ('a') three rows away.
     expect((await read()).cursor).toBe('m')
   })
+})
+
+// Round three: what the second end-user run and the re-audit found.
+describe('round 3', () => {
+  test('a burst of wheel ticks moves the cursor by all of them', async ($, on) => {
+    install(on, Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`f${String(i).padStart(2, '0')}.txt`, file()])))
+    const { read } = await open($, 40, 20)
+    await Promise.all([scroll($, 1, 20, 3), scroll($, 1, 20, 3), scroll($, 1, 20, 3)])
+    expect((await read()).cursor).toBe('f03.txt')
+  })
+
+  test('the cursor follows the focus ring when the person Tabs onto a row', async ($, on) => {
+    // The kit has no focus ring; this answers for it, beneath the plugin.
+    on('ui.focus', async () => ({}))
+    install(on, { 'a.txt': file(), 'b.txt': file(), 'c.txt': file() })
+    const { read } = await open($)
+    await $.ui.focus({ component: 'Pane', requestId: PANE, plugin: PANE, element: K('c.txt'), origin: { kind: 'person' } })
+    const v = await read()
+    expect([v.cursor, v.at]).toEqual(['c.txt', 3])
+  })
+
+  test('a file that could not be read is read again once it can be', async ($, on) => {
+    const w = install(on, { 'a.txt': file('secret', { deny: 'EACCES' }) })
+    const { ui, read } = await open($)
+    await ui.press({ key: K('a.txt') })
+    expect((await read()).boxText).toContain('EACCES')
+    // A chmod: same bytes, same mtime and size.
+    put(w, 'a.txt', file('secret'))
+    await ui.redraw()
+    expect((await read()).source).toBe('secret')
+  })
+
+  test('a short pane keeps the reason there is no preview', async ($, on) => {
+    install(on, { 'a.txt': file('x', { deny: 'EACCES' }), 'clip.mp4': file('x') })
+    for (const [name, why] of [['a.txt', 'EACCES'], ['clip.mp4', 'No preview']] as const) {
+      for (const rows of [6, 7, 8]) {
+        const { ui, read } = await open($, 40, rows)
+        await ui.press({ key: K(name) })
+        expect((await read()).boxText, `${name} bodyRows ${rows}`).toContain(why)
+        await ui.press({ key: 'close-preview' })
+        await ui.unmount()
+      }
+    }
+  })
+
+  test('a narrow box names the reveal button short so it stays on one line', async ($, on) => {
+    install(on, { 'clip.mp4': file('x') })
+    const { ui, read } = await open($, 24, 20)
+    await ui.press({ key: K('clip.mp4') })
+    const v = await read()
+    expect(v.boxText).toContain('Show')
+    expect(v.boxText).not.toContain('Show in file manager')
+  })
+})
+
+describe('big files', () => {
+  // A source file the size of a real module: numbered so the window's first and last rows are checkable.
+  const SOURCE = (n: number) =>
+    Array.from({ length: n }, (_, i) => (i % 10 === 0 ? '' : `export const v${i} = ${i} // line ${i + 1}`)).join('\n')
+
+  for (const n of [500, 1000, 5000]) {
+    test(`a ${n}-line file opens, scrolls by the wheel and jumps to its end`, { timeoutMs: 30000 }, async ($, on) => {
+      const w = install(on, { 'a.txt': file(), 'big.ts': file(SOURCE(n)) })
+      const { ui, read } = await open($, 60, 30)
+      const t0 = Date.now()
+      await ui.press({ key: K('big.ts') })
+      const v = await read()
+      const first = Date.now() - t0
+      expect(v.footer).toBe(true)
+      expect(v.range).toBe(`1-${v.codeLines}/${n}`)
+      expect(height(v.top)).toBe(31)
+      // Ten wheel ticks over the box move its window ten rows and read the file no more.
+      const reads = w.reads.length
+      const boxRow = height((v.top.children ?? []).filter(isEl)[0]) + height((v.top.children ?? []).filter(isEl)[1]) + 1
+      const t1 = Date.now()
+      for (let i = 0; i < 10; i++) await scroll($, 1, 30, boxRow)
+      const wheel = (Date.now() - t1) / 10
+      expect((await read()).range?.startsWith('11-')).toBe(true)
+      expect(w.reads.length).toBe(reads)
+      await ui.press({ key: 'jump-end' })
+      const end = await read()
+      expect(end.range?.endsWith(`-${n}/${n}`)).toBe(true)
+      expect(end.source?.split('\n').pop()).toContain(`line ${n}`)
+      await ui.press({ key: 'jump-top' })
+      expect((await read()).range?.startsWith('1-')).toBe(true)
+      console.log(`${n} lines: open ${first} ms, wheel tick ${wheel.toFixed(1)} ms`)
+      expect(first).toBeLessThan(2000)
+      expect(wheel).toBeLessThan(200)
+    })
+  }
 })
