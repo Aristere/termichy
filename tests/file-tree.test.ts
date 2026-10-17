@@ -1210,3 +1210,31 @@ describe('big files', () => {
     })
   }
 })
+
+// Re-audit of 61968f0: each test names a bug still there.
+describe('round 4', () => {
+  const LINES = (n: number) => Array.from({ length: n }, (_, i) => `line ${i}`).join('\n')
+
+  test('two surfaces whose boxes start on the same row both scroll their preview on a wheel over it', async ($, on) => {
+    // 40 and 41 columns: the same hint, box and previewFrom, so the wheel takes the first surface's window only.
+    install(on, { 'a.txt': file(), 'long.txt': file(LINES(200)) })
+    const rows = 20
+    const one = await open($, 40, rows, 'terminal')
+    await one.ui.press({ key: K('long.txt') })
+    const two = await open($, 41, rows, 'desktop')
+    await two.read()
+    await scroll($, 1, rows, rows - 1)
+    const a = await one.read()
+    const b = await two.read()
+    expect([a.source?.split('\n')[0], b.source?.split('\n')[0]]).toEqual(['line 1', 'line 1'])
+  })
+
+  test('under 14 columns, where no box is drawn, selecting an image runs no sips and a text file is not read', async ($, on) => {
+    const w = install(on, { 'big.txt': file(LINES(1000)), 'pic.png': file('png', { px: { w: 800, h: 600 } }) })
+    const { ui, read } = await open($, 12, 200)
+    await ui.press({ key: K('pic.png') })
+    await ui.press({ key: K('big.txt') })
+    expect((await read()).box).toBeUndefined()
+    expect({ runs: w.runs.map(r => r[0]), reads: w.reads }).toEqual({ runs: [], reads: [] })
+  })
+})
