@@ -146,6 +146,45 @@ const errno = (err: unknown) => {
   return msg.match(/\bE[A-Z0-9]{3,}\b[^,'()\n]*/)?.[0] ?? ''
 }
 
+// Image work runs beside the renders, not in one: a render waiting on sips held every other render and press
+// behind it. The box says "measuring…" until the work lands and a tick redraws.
+const imaging = new Set<string>()
+const measure = ($: any, key: string, arg: string, withPng: boolean) => {
+  if (imaging.has(key)) return
+  imaging.add(key)
+  void (async () => {
+    if (!sizes.has(key)) {
+      const out = await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', arg], { timeoutMs: 5000 }).catch(() => undefined)
+      const w = Number(out?.stdout.match(/pixelWidth:\s*(\d+)/)?.[1])
+      const h = Number(out?.stdout.match(/pixelHeight:\s*(\d+)/)?.[1])
+      remember(sizes, key, w && h ? { w, h } : null, 256)
+    }
+    // Real pixels via the terminal's own image support; sips makes a PNG, shrunk until it fits the 2 MiB the Image takes.
+    if (withPng && sizes.get(key) && !pngs.has(key)) {
+      let b64: string | null = null
+      const dir = (await $.process.run(['mktemp', '-d']).catch(() => undefined))?.stdout.trim()
+      if (dir) {
+        for (const edge of [900, 600, 400, 256, 128]) {
+          const out = `${dir}/p.png`
+          await $.process.run(['sips', '-s', 'format', 'png', '-Z', String(edge), arg, '--out', out], { timeoutMs: 10000 }).catch(() => undefined)
+          const raw = await $.fs.read(out, { as: 'bytes' }).catch(() => undefined)
+          if (raw && typeof raw !== 'string' && (raw.base64.length * 3) / 4 <= IMAGE_MAX) {
+            b64 = raw.base64
+            break
+          }
+        }
+        await $.process.run(['rm', '-rf', dir]).catch(() => undefined)
+      }
+      remember(pngs, key, b64, 8)
+    }
+  })()
+    .catch(() => undefined)
+    .finally(() => {
+      imaging.delete(key)
+      void update($, tick, (n: number) => n + 1).catch(() => undefined)
+    })
+}
+
 const pathOf = (key: string) =>
   key.startsWith('r:') ? decodeURIComponent(key.slice(2)).replace(/\ufffe([0-9a-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))) : undefined
 
@@ -186,9 +225,9 @@ export const register: Register = on => {
     // no surface, and walking the cursor is the move that can't scroll a preview the person isn't looking at.
     const fits = [...geos.values()].filter(x => x.bodyRows === e.bodyRows)
     const g = fits.every(x => x.previewFrom === fits[0]?.previewFrom) ? fits[0] : undefined
-    // A wheel over the preview box scrolls the box; everywhere else it walks the tree.
+    // A wheel over the preview box scrolls the box (on every surface it could be); everywhere else it walks the tree.
     if (g && e.pointer && e.pointer.row >= g.previewFrom) {
-      g.pTop = Math.max(0, Math.min(g.pMax, g.pTop + e.by))
+      for (const x of fits) x.pTop = Math.max(0, Math.min(x.pMax, x.pTop + e.by))
       await update($, tick, n => n + 1).catch(() => undefined)
       return {}
     }
@@ -308,7 +347,7 @@ export const register: Register = on => {
 
       let st: Stat | undefined
       let statErr = ''
-      if (chosen) {
+      if (boxed) {
         try {
           st = await $.fs.stat(chosen, { resolve: true })
         } catch {
@@ -326,40 +365,14 @@ export const register: Register = on => {
       // A relative name starting with a dash would read as an option to sips, open and xdg-open.
       const arg = real.startsWith('-') ? `./${real}` : real
       const imgKey = `${chosen}|${st?.mtimeMs}|${st?.size}`
-      if (isImage && st && !sizes.has(imgKey)) {
-        const out = await $.process
-          .run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', arg])
-          .catch(() => undefined)
-        const w = Number(out?.stdout.match(/pixelWidth:\s*(\d+)/)?.[1])
-        const h = Number(out?.stdout.match(/pixelHeight:\s*(\d+)/)?.[1])
-        remember(sizes, imgKey, w && h ? { w, h } : null, 256)
-      }
+      if (boxed && isImage && st && (!sizes.has(imgKey) || (Image && sizes.get(imgKey) && !pngs.has(imgKey)))) measure($, imgKey, arg, !!Image)
       const dim = sizes.get(imgKey)
-
-      // Real pixels via the terminal's own image support; sips makes a PNG, shrunk until it fits the 2 MiB the Image takes.
-      if (isImage && dim && Image && !pngs.has(imgKey)) {
-        let b64: string | null = null
-        const dir = (await $.process.run(['mktemp', '-d']).catch(() => undefined))?.stdout.trim()
-        if (dir) {
-          for (const edge of [900, 600, 400, 256, 128]) {
-            const out = `${dir}/p.png`
-            await $.process.run(['sips', '-s', 'format', 'png', '-Z', String(edge), arg, '--out', out]).catch(() => undefined)
-            const raw = await $.fs.read(out, { as: 'bytes' }).catch(() => undefined)
-            if (raw && typeof raw !== 'string' && (raw.base64.length * 3) / 4 <= IMAGE_MAX) {
-              b64 = raw.base64
-              break
-            }
-          }
-          await $.process.run(['rm', '-rf', dir]).catch(() => undefined)
-        }
-        remember(pngs, imgKey, b64, 8)
-      }
       const png = pngs.get(imgKey)
 
       // What the box holds: wrapped text rows, or (opaque) the reason no preview is drawn.
       let textRows: string[] = []
       let opaque = ''
-      if (chosen && !isImage) {
+      if (boxed && !isImage) {
         const sig = `${cols}|${chosen}|${st?.mtimeMs}|${st?.size}|${statErr}`
         const made = loaded.get(sig) ?? (await loadText($, chosen, st, statErr, cols - 6))
         // A refusal is asked again each time: a chmod changes neither mtime nor size.
@@ -369,7 +382,7 @@ export const register: Register = on => {
       }
 
       const pathRows = chunk(cleanName(real), cols - 6)
-      const headline = `${isImage ? (dim ? `${dim.w} × ${dim.h} px` : 'size unknown') : opaque}${st && st.kind === 'file' ? `  ·  ${human(st.size)}` : ''}`
+      const headline = `${isImage ? (dim ? `${dim.w} × ${dim.h} px` : imaging.has(imgKey) ? 'measuring…' : 'size unknown') : opaque}${st && st.kind === 'file' ? `  ·  ${human(st.size)}` : ''}`
       const headRows = chunk(headline, cols - 6)
       const imgCols = Math.max(8, Math.min(80, cols - 6))
       const drawImg = !!(isImage && dim && png && Image)
