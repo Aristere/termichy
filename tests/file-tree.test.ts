@@ -1578,3 +1578,18 @@ describe('round 7', () => {
     expect(bad).toEqual([])
   })
 })
+
+describe('round 8', () => {
+  test('a resize keeps the preview on the line it showed', async ($, on) => {
+    install(on, { 'wide.ts': file(Array.from({ length: 300 }, (_, i) => `const line${i + 1} = '${'word '.repeat(50)}'`).join('\n')) })
+    const rows = 30
+    const { ui, read } = await open($, 120, rows)
+    await ui.press({ key: K('wide.ts') })
+    for (let i = 0; i < 6; i++) await scroll($, rows, rows)
+    const before = (await read()).range?.split('-')[0]
+    for (const cols of [80, 60, 140, 120]) {
+      await ui.redraw(props(cols, rows))
+      expect((await read()).range?.split('-')[0], `cols ${cols}`).toBe(before)
+    }
+  })
+})

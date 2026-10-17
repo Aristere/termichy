@@ -17,7 +17,16 @@ let cursorRead = false
 let shown = ''
 // Each surface has its own window: tree top, preview top and last offset, and the body row where the box starts
 // (Infinity: no box). ui.scroll names no surface, so it finds its window by bodyRows.
-type Geo = { bodyRows: number; top: number; pTop: number; pMax: number; page: number; previewFrom: number }
+// `anchor` is the preview's top row as a place in the file (line and offset), so a new width finds the same place.
+type Geo = {
+  bodyRows: number
+  top: number
+  pTop: number
+  pMax: number
+  page: number
+  previewFrom: number
+  anchor?: { sig: string; width: number; line: number; at: number }
+}
 const geos = new Map<string, Geo>()
 // Renders run one at a time: one slowed by sips that finished after a newer one left the engine holding
 // buttons from a drawing it no longer showed, and presses on them did nothing.
@@ -44,7 +53,7 @@ type Loaded = { lines: string[]; modes: string[]; ext: string; opaque: string; c
 const loaded = new Map<string, Loaded>()
 // One drawn row of a text preview: the line it belongs to, its number in the gutter (0 on a continuation row), its
 // text and what it starts inside of.
-type TextRow = { line: number; n: number; text: string; kind: Kind }
+type TextRow = { line: number; at: number; n: number; text: string; kind: Kind }
 const wraps = new Map<string, TextRow[]>()
 
 // Code colours each line on its own, so a line inside a block comment or a multi-line string comes out coloured
@@ -164,7 +173,7 @@ const layoutText = (made: Loaded, width: number): TextRow[] => {
     const later = parts.length < 2 ? [] : plain ? parts.map(() => kindOf(mode)) : scan(line, mode, made.ext, parts.slice(1).map(p => p.at)).at
     parts.forEach((p, j) =>
       // Code drops empty lines, so a blank one is drawn as a space and keeps its row.
-      out.push({ line: k, n: made.gutter && j === 0 ? k + 1 : 0, text: p.text || ' ', kind: j ? later[j - 1] ?? 0 : kindOf(mode) }),
+      out.push({ line: k, at: p.at, n: made.gutter && j === 0 ? k + 1 : 0, text: p.text || ' ', kind: j ? later[j - 1] ?? 0 : kindOf(mode) }),
     )
   })
   return out
@@ -559,7 +568,12 @@ export const register: Register = on => {
       const footer = !isImage && !opaque && (textRows.length > boxRows - 3 || made.cut) && boxRows >= 6 && cols >= 20
       const previewRoom = Math.max(0, boxRows - 3 - (footer ? 1 : 0))
       const pMax = Math.max(0, textRows.length - previewRoom)
-      const pTop = Math.min(g.pTop, pMax)
+      // Rows are per width, so after a resize the window starts on the row now holding the place it showed before.
+      const a = g.anchor
+      const moved = !!a && a.sig === sig && a.width !== lineW
+      // The last row that starts at or before the anchored place.
+      const after = !moved ? -1 : textRows.findIndex(r => r.line > a.line || (r.line === a.line && r.at > a.at))
+      const pTop = Math.min(moved ? Math.max(0, (after < 0 ? textRows.length : after) - 1) : g.pTop, pMax)
 
       // The tree takes whatever the box leaves, so a short preview sits at the bottom and a long one grows upward.
       const treeRoom = Math.max(1, bodyRows - hintRows.length - boxRows)
@@ -585,6 +599,8 @@ export const register: Register = on => {
       }
       // A pane resized while open can keep the engine's window offset, with the hint scrolled off the top.
       if (g.bodyRows && g.bodyRows !== bodyRows) void $.ui.scroll({ in: PANE, to: 'start' }).catch(() => undefined)
+      const topRow = textRows[pTop]
+      g.anchor = topRow ? { sig, width: lineW, line: topRow.line, at: topRow.at } : undefined
       Object.assign(g, { bodyRows, top, pTop, pMax, page: !isImage && !opaque ? previewRoom : 0, previewFrom: boxed ? hintRows.length + treeRoom : Infinity })
 
       // The close button unmounts with the box and the engine hands its focus to whichever row now sits there; put it back on the cursor.
