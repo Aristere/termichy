@@ -531,19 +531,19 @@ describe('preview', () => {
     await ui.press({ key: K('four.txt') })
     expect(w.reads).toEqual(['four.txt'])
     expect(w.runs).toEqual([])
-    expect((await read()).source?.split('\n')[0]).toBe('y'.repeat(34))
+    expect((await read()).source?.split('\n')[0]).toMatch(/^y+$/)
   })
 
-  test('4 MiB + 1 is read with head -c 4194304 -- and the last row says it is truncated', { timeoutMs: 20000 }, async ($, on) => {
+  test('4 MiB + 1 is read with head -c 4194304 -- and the footer says it is cut', { timeoutMs: 20000 }, async ($, on) => {
     const w = install(on, { 'over.txt': file(big(MiB4 + 1)) })
     const rows = 20
     const { ui, read } = await open($, 40, rows)
     await ui.press({ key: K('over.txt') })
     expect(w.reads).toEqual([])
     expect(w.runs).toEqual([['head', '-c', '4194304', '--', 'over.txt']])
-    await scroll($, 1e9, rows, rows - 1)
-    const last = (await read()).source?.split('\n').pop() ?? ''
-    expect(last).toBe('… first 4,194,304 of 4,194,305 bytes shown')
+    const v = await read()
+    expect(v.footer).toBe(true)
+    expect(v.boxText).toMatch(/· cut/)
   })
 
   test('a >4 MiB file whose name starts with "-" reaches head after --', { timeoutMs: 20000 }, async ($, on) => {
@@ -551,7 +551,7 @@ describe('preview', () => {
     const { ui, read } = await open($)
     await ui.press({ key: K('-dash.log') })
     expect(w.runs.find(a => a[0] === 'head')).toEqual(['head', '-c', '4194304', '--', '-dash.log'])
-    expect((await read()).source?.split('\n')[0]).toBe('y'.repeat(34))
+    expect((await read()).source?.split('\n')[0]).toMatch(/^y+$/)
   })
 
   test('fs.read refused with EACCES: preview says Cannot read this file (EACCES)', async ($, on) => {
@@ -1029,7 +1029,7 @@ describe('re-audit', () => {
     for (const el of all(box)) {
       if (el.type === 'Button') {
         for (const l of String(el.props?.label ?? textOf(el)).split('\n')) if (width(l) + 4 > inner) bad.push(`button ${JSON.stringify(l)}`)
-      } else if (el.type === 'Box' && el.props?.flexDirection === 'row') {
+      } else if (el.type === 'Box' && el.props?.flexDirection === 'row' && all(el).some(k => k.props?.key === 'jump-top')) {
         const w = (el.children ?? []).filter(isEl).reduce((n, k) => n + width(textOf(k)) + (k.type === 'Button' ? 4 : 0), 0)
         if (w > inner) bad.push(`footer ${w} cells`)
       }
@@ -1236,5 +1236,80 @@ describe('round 4', () => {
     await ui.press({ key: K('big.txt') })
     expect((await read()).box).toBeUndefined()
     expect({ runs: w.runs.map(r => r[0]), reads: w.reads }).toEqual({ runs: [], reads: [] })
+  })
+})
+
+describe('code preview', () => {
+  // The box's lines as drawn: the gutter's numbers, and each run as Code (code) or Text (plain, dim for a comment).
+  const preview = (box: El | undefined) => {
+    const row = box ? all(box).find(e => e.type === 'Box' && e.props?.flexDirection === 'row' && !all(e).some(k => k.props?.key === 'jump-top')) : undefined
+    const kids = (row?.children ?? []).filter(isEl)
+    const gutter = kids.length > 1 ? textOf(kids[0]).split('\n').map(s => s.trim()) : []
+    const runs = (kids[kids.length - 1]?.children ?? []).filter(isEl).map(r => ({
+      as: r.type === 'Code' ? 'code' : r.props?.dimColor ? 'comment' : 'plain',
+      lines: (r.type === 'Code' ? String(r.props?.source ?? '') : textOf(r)).split('\n'),
+    }))
+    return { gutter, runs }
+  }
+
+  test('lines inside a block comment or a template literal are drawn plain, not through the highlighter', async ($, on) => {
+    install(on, { 'a.ts': file('/**\n * function const return 42\n */\nconst a = 1 // tail\nconst s = `one\ntwo function 7\n`\nconst b = 2') })
+    const { ui, read } = await open($, 60, 30)
+    await ui.press({ key: K('a.ts') })
+    const { gutter, runs } = preview((await read()).box)
+    expect(gutter).toEqual(['1', '2', '3', '4', '5', '6', '7', '8'])
+    expect(runs.map(r => [r.as, r.lines.length])).toEqual([['code', 1], ['comment', 2], ['code', 2], ['plain', 2], ['code', 1]])
+  })
+
+  test('a Python docstring is drawn plain, and # or a quote in code opens nothing', async ($, on) => {
+    install(on, { 'b.py': file('def f():\n    """doc\n    def class return\n    """\n    s = "it\'s # not"  # a """ in a comment\n    return 1') })
+    const { ui, read } = await open($, 60, 30)
+    await ui.press({ key: K('b.py') })
+    const { runs } = preview((await read()).box)
+    expect(runs.map(r => [r.as, r.lines.length])).toEqual([['code', 2], ['plain', 2], ['code', 2]])
+  })
+
+  test('the gutter numbers the lines shown, from where the window starts', async ($, on) => {
+    install(on, { 'n.txt': file(Array.from({ length: 300 }, (_, i) => `row ${i + 1}`).join('\n')) })
+    const { ui, read } = await open($, 40, 20)
+    await ui.press({ key: K('n.txt') })
+    await ui.press({ key: 'jump-end' })
+    const v = await read()
+    const { gutter, runs } = preview(v.box)
+    expect(gutter[gutter.length - 1]).toBe('300')
+    expect(runs[0]?.lines[0]).toBe(`row ${gutter[0]}`)
+  })
+
+  test('PageDown and PageUp scroll an open text preview by its height; with none they page the tree', async ($, on) => {
+    install(on, { 'long.txt': file(Array.from({ length: 200 }, (_, i) => `line ${i}`).join('\n')), ...Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`f${String(i).padStart(2, '0')}.txt`, file()])) })
+    const rows = 20
+    const { ui, read } = await open($, 40, rows)
+    await scroll($, rows, rows)
+    expect((await read()).at).toBe(21)
+    // End brings long.txt, the last row, into the window.
+    await scroll($, rows + 1, rows)
+    await ui.press({ key: K('long.txt') })
+    const room = (await read()).codeLines
+    await scroll($, rows, rows)
+    expect((await read()).range).toBe(`${room}-${2 * room - 1}/200`)
+    await scroll($, -rows, rows)
+    expect((await read()).range).toBe(`1-${room}/200`)
+    expect((await read()).cursor).toBe('long.txt')
+  })
+
+  test('a 200 KB one-line minified file stays under the 100,000 characters a drawing takes', async ($, on) => {
+    install(on, { 'min.js': file('var a=1;'.repeat(25000)) })
+    const { ui, read } = await open($, 60, 30)
+    await ui.press({ key: K('min.js') })
+    const v = await read()
+    expect(textOf(v.top).length).toBeLessThan(100000)
+    expect(v.source?.split('\n')).toHaveLength(1)
+  })
+
+  test('the range counts the file\'s lines, not wrapped rows', async ($, on) => {
+    install(on, { 'wide.ts': file(Array.from({ length: 1000 }, (_, i) => `const x${i} = '${'w'.repeat(290)}'`).join('\n')) })
+    const { ui, read } = await open($, 60, 30)
+    await ui.press({ key: K('wide.ts') })
+    expect((await read()).range).toMatch(/^1-\d+\/1000$/)
   })
 })

@@ -17,7 +17,7 @@ let cursorRead = false
 let shown = ''
 // Each surface has its own window: tree top, preview top and last offset, and the body row where the box starts
 // (Infinity: no box). ui.scroll names no surface, so it finds its window by bodyRows.
-type Geo = { bodyRows: number; top: number; pTop: number; pMax: number; previewFrom: number }
+type Geo = { bodyRows: number; top: number; pTop: number; pMax: number; page: number; previewFrom: number }
 const geos = new Map<string, Geo>()
 // Renders run one at a time: one slowed by sips that finished after a newer one left the engine holding
 // buttons from a drawing it no longer showed, and presses on them did nothing.
@@ -38,8 +38,50 @@ const OPAQUE = new Set([
 const sizes = new Map<string, { w: number; h: number } | null>()
 // A PNG is up to 2.7 MB of base64, so only the last few previewed stay.
 const pngs = new Map<string, string | null>()
-// The wrapped text of the previewed file, so a wheel tick slices rows instead of re-reading the file.
-const loaded = new Map<string, { rows: string[]; opaque: string }>()
+// The lines of the previewed file, so a wheel tick slices them instead of re-reading the file. A 4 MiB log is
+// over 100 MB of lines, so only two stay.
+type Loaded = { rows: string[]; kinds: Kind[]; opaque: string; cut: boolean; gutter: boolean }
+const loaded = new Map<string, Loaded>()
+
+// Code colours each line on its own, so a line inside a block comment or a multi-line string comes out coloured
+// as code. This finds the lines that start inside one (/* */, JS template literals, Python triple quotes); they
+// are drawn plain instead, dim for a comment.
+type Kind = 0 | 1 | 2
+const C_LIKE = new Set('js mjs cjs ts tsx jsx css scss less c h cc cpp hpp java kt swift go rs cs dart php'.split(' '))
+const BACKTICK = new Set('js mjs cjs ts tsx jsx go'.split(' '))
+const kindsOf = (lines: string[], e: string): Kind[] => {
+  const c = C_LIKE.has(e)
+  const tick = BACKTICK.has(e)
+  const py = e === 'py'
+  const out: Kind[] = []
+  let mode = ''
+  for (const line of lines) {
+    out.push(mode === '' ? 0 : mode === '*/' ? 1 : 2)
+    let q = ''
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i]
+      if (mode) {
+        if (mode !== '*/' && ch === '\\') i++
+        else if (line.startsWith(mode, i)) {
+          i += mode.length - 1
+          mode = ''
+        }
+      } else if (q) {
+        if (ch === '\\') i++
+        else if (ch === q) q = ''
+      } else if ((c && line.startsWith('//', i)) || (py && ch === '#')) break
+      else if (c && line.startsWith('/*', i)) {
+        mode = '*/'
+        i++
+      } else if (py && (line.startsWith('"""', i) || line.startsWith("'''", i))) {
+        mode = line.slice(i, i + 3)
+        i += 2
+      } else if (tick && ch === '`') mode = '`'
+      else if (ch === '"' || ch === "'") q = ch
+    }
+  }
+  return out
+}
 const remember = <V,>(map: Map<string, V>, key: string, value: V, max: number) => {
   map.delete(key)
   map.set(key, value)
@@ -129,6 +171,7 @@ const fit = (text: string, width: number) => {
   }
   return text
 }
+const textCells = (text: string) => Array.from(text).reduce((n, ch) => n + cells(ch.codePointAt(0)!), 0)
 // The first n of a wrapped text's lines, the last marked as cut when lines were left over.
 const clip = (lines: string[], n: number, width: number) =>
   lines.length <= n ? lines : n <= 0 ? [] : [...lines.slice(0, n - 1), fit(`${lines[n - 1]} …`, width)]
@@ -231,9 +274,16 @@ export const register: Register = on => {
       await update($, tick, n => n + 1).catch(() => undefined)
       return {}
     }
-    if (order.length === 0) return {}
     // Home and End ask for contentRows, which the padding keeps near bodyRows, far short of a long list's ends.
     const ends = !e.pointer && Math.abs(e.by) >= e.contentRows
+    // Page keys (bodyRows) scroll an open text preview by its height, since nothing else reaches the middle of a long
+    // file from the keyboard; with no preview they page the tree.
+    if (g && !e.pointer && !ends && Math.abs(e.by) === e.bodyRows && g.pMax > 0) {
+      for (const x of fits) x.pTop = Math.max(0, Math.min(x.pMax, x.pTop + Math.sign(e.by) * Math.max(1, x.page - 1)))
+      await update($, tick, n => n + 1).catch(() => undefined)
+      return {}
+    }
+    if (order.length === 0) return {}
     const from = Math.max(0, order.indexOf(at))
     const to = ends ? (e.by > 0 ? order.length - 1 : 0) : from + e.by
     at = order[Math.min(order.length - 1, Math.max(0, to))] ?? at
@@ -267,7 +317,7 @@ export const register: Register = on => {
 
     async function draw() {
       const { Box, Text, Button, Code, Image } = $.ui.resolve(e) as ReturnType<typeof $.ui.resolve> & { Image?: any }
-      const g: Geo = geos.get(e.surface) ?? { bodyRows: 0, top: 0, pTop: 0, pMax: 0, previewFrom: Infinity }
+      const g: Geo = geos.get(e.surface) ?? { bodyRows: 0, top: 0, pTop: 0, pMax: 0, page: 0, previewFrom: Infinity }
       geos.set(e.surface, g)
       const open = new Set(await read($, expanded))
       const chosen = await read($, selected)
@@ -334,7 +384,7 @@ export const register: Register = on => {
           list.includes(path) ? list.filter(p => p !== path) : [...list, path],
         )
 
-      const hint = `${order.indexOf(at) + 1}/${rows.length} · ↑↓ move · Enter open · Tab also walks · Esc back`
+      const hint = `${order.indexOf(at) + 1}/${rows.length} · ↑↓ move · Enter open · PgUp/PgDn scroll preview · Esc back`
       // Under 12 rows the hint keeps to one line, and under 6 it gives its row to the tree.
       const hintRows = bodyRows >= 12 ? chunk(hint, cols - 1) : bodyRows >= 6 ? [fit(hint, cols - 1)] : []
       // The box takes up to 60% and leaves the tree three rows (one in a small pane); title and border are its least.
@@ -369,17 +419,16 @@ export const register: Register = on => {
       const dim = sizes.get(imgKey)
       const png = pngs.get(imgKey)
 
-      // What the box holds: wrapped text rows, or (opaque) the reason no preview is drawn.
-      let textRows: string[] = []
-      let opaque = ''
+      // What the box holds: the file's lines, or (opaque) the reason no preview is drawn.
+      let made: Loaded = { rows: [], kinds: [], opaque: '', cut: false, gutter: false }
       if (boxed && !isImage) {
-        const sig = `${cols}|${chosen}|${st?.mtimeMs}|${st?.size}|${statErr}`
-        const made = loaded.get(sig) ?? (await loadText($, chosen, st, statErr, cols - 6))
+        const sig = `${chosen}|${st?.mtimeMs}|${st?.size}|${statErr}`
+        made = loaded.get(sig) ?? (await loadText($, chosen, st, statErr))
         // A refusal is asked again each time: a chmod changes neither mtime nor size.
-        if (!made.opaque.startsWith('Cannot read')) remember(loaded, sig, made, 4)
-        textRows = made.rows
-        opaque = made.opaque
+        if (!made.opaque.startsWith('Cannot read')) remember(loaded, sig, made, 2)
       }
+      const textRows = made.rows
+      const opaque = made.opaque
 
       const pathRows = chunk(cleanName(real), cols - 6)
       const headline = `${isImage ? (dim ? `${dim.w} × ${dim.h} px` : imaging.has(imgKey) ? 'measuring…' : 'size unknown') : opaque}${st && st.kind === 'file' ? `  ·  ${human(st.size)}` : ''}`
@@ -402,7 +451,7 @@ export const register: Register = on => {
       const textBox = Math.min(maxBox, textRows.length + 3)
       const boxRows = !boxed ? 0 : isImage || opaque ? 3 + buttons + headShown.length + pathShown.length + imgRows : textBox
       // A long text gets a footer row for the jump buttons: a wheel tick moves a few rows, too slow to cross a big file.
-      const footer = !isImage && !opaque && textRows.length > boxRows - 3 && boxRows >= 6 && cols >= 20
+      const footer = !isImage && !opaque && (textRows.length > boxRows - 3 || made.cut) && boxRows >= 6 && cols >= 20
       const previewRoom = Math.max(0, boxRows - 3 - (footer ? 1 : 0))
       const pMax = Math.max(0, textRows.length - previewRoom)
       const pTop = Math.min(g.pTop, pMax)
@@ -431,7 +480,7 @@ export const register: Register = on => {
       }
       // A pane resized while open can keep the engine's window offset, with the hint scrolled off the top.
       if (g.bodyRows && g.bodyRows !== bodyRows) void $.ui.scroll({ in: PANE, to: 'start' }).catch(() => undefined)
-      Object.assign(g, { bodyRows, top, pTop, pMax, previewFrom: boxed ? hintRows.length + treeRoom : Infinity })
+      Object.assign(g, { bodyRows, top, pTop, pMax, page: previewRoom, previewFrom: boxed ? hintRows.length + treeRoom : Infinity })
 
       // The close button unmounts with the box and the engine hands its focus to whichever row now sits there; put it back on the cursor.
       const closePreview = async () => {
@@ -457,7 +506,23 @@ export const register: Register = on => {
         // Not `cmd /c start`: cmd parses the name again, and a file named `a&calc` would run calc.
         launch([['open', arg], ['xdg-open', arg], ['explorer', real]], 'Opened', 'No app could open this file')
 
-      const range = fit(`${pTop + 1}-${Math.min(textRows.length, pTop + previewRoom)}/${textRows.length}`, Math.max(1, cols - 6 - 12))
+      const shownRange = `${pTop + 1}-${Math.min(textRows.length, pTop + previewRoom)}/${textRows.length}`
+      const rangeW = Math.max(1, cols - 6 - 12)
+      // A file past 4 MiB says so in the footer, in the long words where they fit.
+      const range = fit(!made.cut ? shownRange : textCells(`${shownRange} · cut at 4 MiB`) <= rangeW ? `${shownRange} · cut at 4 MiB` : `${shownRange} · cut`, rangeW)
+      // Line numbers, then each run of lines of one kind: code through Code, comment and string interiors plain.
+      // Code cuts a long line at the edge; plain lines are cut here to the same width.
+      const gutterW = made.gutter ? String(textRows.length).length + 1 : 0
+      const lineW = Math.max(1, cols - 4 - gutterW)
+      const runs: { kind: Kind; from: number; lines: string[] }[] = []
+      for (let i = pTop; i < Math.min(textRows.length, pTop + previewRoom); i++) {
+        const kind = made.kinds[i] ?? 0
+        const last = runs[runs.length - 1]
+        // Code drops empty lines, so a blank one is drawn as a space and keeps its row.
+        const line = textRows[i] || ' '
+        if (last && last.kind === kind) last.lines.push(line)
+        else runs.push({ kind, from: i, lines: [line] })
+      }
       const jump = async (to: number) => {
         g.pTop = to
         await update($, tick, n => n + 1)
@@ -536,13 +601,30 @@ export const register: Register = on => {
                   )}
                 </Box>
               ) : previewRoom > 0 && (
-                <Code
-                  // Code drops empty lines, so a blank one is drawn as a space and keeps its row.
-                  source={textRows.slice(pTop, pTop + previewRoom).map(l => l || ' ').join('\n')}
-                  language={LANG[ext(chosen)]}
-                  path={cleanName(chosen)}
-                  wrap="truncate-end"
-                />
+                <Box flexDirection="row">
+                  {gutterW > 0 && (
+                    <Text dimColor>
+                      {runs.flatMap(r => r.lines.map((_, j) => `${String(r.from + j + 1).padStart(gutterW - 1)} `)).join('\n')}
+                    </Text>
+                  )}
+                  <Box flexDirection="column" width={lineW}>
+                    {runs.map(r =>
+                      r.kind === 0 ? (
+                        <Code
+                          key={`run-${r.from}`}
+                          source={r.lines.join('\n')}
+                          language={LANG[ext(chosen)]}
+                          path={cleanName(chosen)}
+                          wrap="truncate-end"
+                        />
+                      ) : (
+                        <Text key={`run-${r.from}`} dimColor={r.kind === 1}>
+                          {r.lines.map(l => fit(l, lineW)).join('\n')}
+                        </Text>
+                      ),
+                    )}
+                  </Box>
+                </Box>
               )}
               {footer && (
                 <Box flexDirection="row">
@@ -565,12 +647,12 @@ export const register: Register = on => {
 }
 
 // Reads one file for the box: wrapped rows, or the reason it has none. Never reads a pipe or device, which can block.
-async function loadText($: any, path: string, st: Stat | undefined, statErr: string, width: number) {
-  const none = (opaque: string) => ({ rows: [] as string[], opaque })
+async function loadText($: any, path: string, st: Stat | undefined, statErr: string): Promise<Loaded> {
+  const none = (opaque: string): Loaded => ({ rows: [], kinds: [], opaque, cut: false, gutter: false })
   if (!st) return none(statErr.startsWith('ENOENT') ? 'File not found' : statErr ? `Cannot read this file (${clean(statErr)})` : 'Cannot read this file')
   if (st.kind !== 'file') return none(st.isLink && !st.realPath ? 'Broken link' : 'Not a regular file')
   if (OPAQUE.has(ext(path))) return none('No preview in the terminal')
-  if (st.size === 0) return { rows: ['(empty file)'], opaque: '' }
+  if (st.size === 0) return { rows: ['(empty file)'], kinds: [0], opaque: '', cut: false, gutter: false }
   let text: string | undefined
   let cut = false
   try {
@@ -591,7 +673,7 @@ async function loadText($: any, path: string, st: Stat | undefined, statErr: str
   if (text.includes('\0')) return none('Binary file')
   const lines = text.replace(/\r\n/g, '\n').split('\n')
   if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop()
-  const rows = lines.flatMap(l => chunk(clean(l.replace(/\t/g, '  ')), width))
-  if (cut) rows.push(`… first ${READ_MAX.toLocaleString()} of ${st.size.toLocaleString()} bytes shown`)
-  return { rows, opaque: '' }
+  // A drawing takes 100,000 characters in all, so a minified line is kept to its first thousand.
+  const rows = lines.map(l => clean(l.slice(0, 1000).replace(/\t/g, '  ')))
+  return { rows, kinds: kindsOf(lines, ext(path)), opaque: '', cut, gutter: true }
 }

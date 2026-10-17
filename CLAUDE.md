@@ -42,7 +42,8 @@ Layout arithmetic is cell-based, not character-based. Wide (CJK, emoji) characte
 Preview rules in `loadText` and the render body:
 
 - Only regular files are read; pipes and devices are never opened because they can block. Images are only sent to `sips` if `stat` says `file`.
-- Text reads stop at 4 MiB (`READ_MAX`, the engine's limit for `$.fs.read` and process stdout); bigger files are read with `head -c` and get a "first N of M bytes" row. Extensions in `OPAQUE` skip the read.
+- Text reads stop at 4 MiB (`READ_MAX`, the engine's limit for `$.fs.read` and process stdout); bigger files are read with `head -c` and the footer says "cut". Extensions in `OPAQUE` skip the read.
+- The text box shows whole file lines, each cut at the edge (`wrap="truncate-end"`, and at 1,000 characters before that, since a drawing takes 100,000 in all), behind the plugin's own line-number gutter. `Code` highlights each line on its own, so `kindsOf` finds lines that start inside a `/* */` comment, a JS template literal or a Python triple-quoted string, and those runs are drawn as plain `Text` (dim for a comment) between `Code` runs. PageUp/PageDown scroll an open text preview by its height.
 - Images go through macOS `sips` in the background (size query, then PNG downscale through 900/600/400/256/128 px until under the 2 MiB `IMAGE_MAX`). Open and reveal buttons try `open`/`xdg-open`/`explorer` in turn (never `cmd /c start`, which re-parses the name, so `a&calc` would run calc), so the non-image paths are meant to stay cross-platform while image preview is macOS-only.
 - Row buttons are keyed with `rowKey` (`encodeURIComponent` of the path, with lone surrogates spelled out first because `encodeURIComponent` throws on them) so names never collide with fixed button keys like `close-preview`.
 - OS refusals come back from the engine as text with no `code`; `errno` pulls the `E…` token (for example `EACCES`) out of the message for the box.
