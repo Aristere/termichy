@@ -124,7 +124,7 @@ const wrapLine = (line: string, width: number) => {
   // 4 MiB log feels on every resize.
   const narrow = !/[\u0300-\u036f\u1100-\uffff]/.test(line)
   if (narrow && line.length <= width) return [{ at: 0, text: line }]
-  const chars = narrow ? line.split('') : Array.from(line)
+  const chars = narrow ? line.split('') : units(line)
   const lead = line.length - line.trimStart().length
   const pad = ' '.repeat(Math.min(lead + 2, Math.floor(width / 2)))
   const rows: { at: number; text: string }[] = []
@@ -134,7 +134,8 @@ const wrapLine = (line: string, width: number) => {
     const room = rows.length ? width - pad.length : width
     let end = start
     let used = 0
-    while (end < chars.length && used + cells(chars[end]!.codePointAt(0)!) <= room) used += cells(chars[end++]!.codePointAt(0)!)
+    if (narrow) end = Math.min(chars.length, start + room)
+    else while (end < chars.length && used + textCells(chars[end]!) <= room) used += textCells(chars[end++]!)
     if (end === start && end < chars.length) end++
     if (end < chars.length) {
       for (let k = end - 1; k > start + (end - start) / 2; k--) {
@@ -226,14 +227,25 @@ const cells = (cp: number) =>
       ? 2
       : 1
 
+const textCells = (text: string) => Array.from(text).reduce((n, ch) => n + cells(ch.codePointAt(0)!), 0)
+// Code points, with a U+FE0F kept on its base, so no wrap or cut parts ❤ from the selector that makes it an emoji.
+const units = (text: string) => {
+  const out: string[] = []
+  for (const ch of text) {
+    if (ch === '\ufe0f' && out.length) out[out.length - 1] += ch
+    else out.push(ch)
+  }
+  return out
+}
+
 // Hard-wraps by display cells so every item's row count is known before it is drawn.
 const chunk = (text: string, width: number) => {
   const w = Math.max(1, width)
   const out: string[] = []
   let line = ''
   let used = 0
-  for (const ch of text) {
-    const c = cells(ch.codePointAt(0)!)
+  for (const ch of units(text)) {
+    const c = textCells(ch)
     if (used + c > w && line) {
       out.push(line)
       line = ''
@@ -248,8 +260,8 @@ const chunk = (text: string, width: number) => {
 const fit = (text: string, width: number) => {
   const kept: [string, number][] = []
   let used = 0
-  for (const ch of text) {
-    const c = cells(ch.codePointAt(0)!)
+  for (const ch of units(text)) {
+    const c = textCells(ch)
     if (used + c > width) {
       // Drop back until the ellipsis fits: a dropped combining mark frees no cell.
       while (kept.length && used + 1 > width) used -= kept.pop()![1]
@@ -260,7 +272,6 @@ const fit = (text: string, width: number) => {
   }
   return text
 }
-const textCells = (text: string) => Array.from(text).reduce((n, ch) => n + cells(ch.codePointAt(0)!), 0)
 // The first n of a wrapped text's lines, the last marked as cut when lines were left over.
 const clip = (lines: string[], n: number, width: number) =>
   lines.length <= n ? lines : n <= 0 ? [] : [...lines.slice(0, n - 1), fit(`${lines[n - 1]} …`, width)]
@@ -617,10 +628,11 @@ export const register: Register = on => {
         g.pTop = to
         await update($, tick, n => n + 1)
       }
-      // A narrow box drops "(press to close)" before the title would wrap.
-      const closeHint = cols - 6 - 4 - 17 >= 6
+      // The title button's label gets cols - 8 cells: the title, a space, then "(press to close)" (16), which a narrow
+      // box drops before the title would wrap.
+      const closeHint = cols - 9 - 16 >= 6
       // With no footer to say so, a file cut at 4 MiB says it in the title.
-      const titleW = cols - 6 - 4 - (closeHint ? 17 : 0)
+      const titleW = cols - 9 - (closeHint ? 16 : 0)
       const cutMark = made.cut && !footer && titleW - 6 >= 1 ? ' · cut' : ''
       const title = fit(cleanName(chosen), Math.max(1, titleW - cutMark.length)) + cutMark
 
