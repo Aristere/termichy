@@ -1438,3 +1438,23 @@ describe('wrapping', () => {
     expect((await read()).range).toMatch(/^1-\d\/3$/)
   })
 })
+
+describe('round 6', () => {
+  test('PageDown over a text preview that cannot scroll leaves the tree cursor where it is', async ($, on) => {
+    install(on, { 'one.txt': file('just one line'), ...Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`f${String(i).padStart(2, '0')}.txt`, file()])) })
+    const rows = 20
+    const { ui, read } = await open($, 40, rows)
+    await ui.press({ key: K('f00.txt') })
+    await scroll($, rows, rows)
+    expect((await read()).cursor).toBe('f00.txt')
+  })
+
+  test('PageDown with an opaque preview open still pages the tree', async ($, on) => {
+    install(on, { 'a.mp4': file('x'), ...Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`f${String(i).padStart(2, '0')}.txt`, file()])) })
+    const rows = 20
+    const { ui, read } = await open($, 40, rows)
+    await ui.press({ key: K('a.mp4') })
+    await scroll($, rows, rows)
+    expect((await read()).at).toBe(21)
+  })
+})

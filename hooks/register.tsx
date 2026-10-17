@@ -356,8 +356,8 @@ export const register: Register = on => {
     // Home and End ask for contentRows, which the padding keeps near bodyRows, far short of a long list's ends.
     const ends = !e.pointer && Math.abs(e.by) >= e.contentRows
     // Page keys (bodyRows) scroll an open text preview by its height, since nothing else reaches the middle of a long
-    // file from the keyboard; with no preview they page the tree.
-    if (g && !e.pointer && !ends && Math.abs(e.by) === e.bodyRows && g.pMax > 0) {
+    // file from the keyboard, and do nothing at its ends; with no text preview they page the tree.
+    if (g && !e.pointer && !ends && Math.abs(e.by) === e.bodyRows && g.page > 0) {
       for (const x of fits) x.pTop = Math.max(0, Math.min(x.pMax, x.pTop + Math.sign(e.by) * Math.max(1, x.page - 1)))
       await update($, tick, n => n + 1).catch(() => undefined)
       return {}
@@ -564,7 +564,7 @@ export const register: Register = on => {
       }
       // A pane resized while open can keep the engine's window offset, with the hint scrolled off the top.
       if (g.bodyRows && g.bodyRows !== bodyRows) void $.ui.scroll({ in: PANE, to: 'start' }).catch(() => undefined)
-      Object.assign(g, { bodyRows, top, pTop, pMax, page: previewRoom, previewFrom: boxed ? hintRows.length + treeRoom : Infinity })
+      Object.assign(g, { bodyRows, top, pTop, pMax, page: !isImage && !opaque ? previewRoom : 0, previewFrom: boxed ? hintRows.length + treeRoom : Infinity })
 
       // The close button unmounts with the box and the engine hands its focus to whichever row now sits there; put it back on the cursor.
       const closePreview = async () => {
