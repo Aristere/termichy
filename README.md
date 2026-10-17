@@ -54,9 +54,9 @@ What it hooks and sets:
 - `command.run` for `/tree` only. It opens the pane and handles `/tree setup`. It does not touch any other command or any permission prompt.
 - `tool.call`, only to redraw the tree after a tool may have changed files. It reads no tool input or output and passes every call on unchanged.
 - `/tree setup` writes two plugin settings with `config.set`: `file-tree.width` and `file-tree.openOnStart`. Nothing else is set, and no environment variables.
-- It reads no credentials. The only user-level file it names is `~/.claude.json`, which the engine itself uses to remember a dragged pane width.
+- It reads no credentials, tokens or API keys, and nothing it reads is sent anywhere.
 
-It stores three things locally: your two setup answers (in `~/.claude/settings.json`), a flag that the first-run tip was shown (in `~/.claude/plugins/store/`), and the pane width if you drag it (in `~/.claude.json`).
+It stores three things locally: your two setup answers (in `~/.claude/settings.json`), a flag that the first-run tip was shown (in `~/.claude/plugins/store/`), and the pane width if you drag it (kept by Claude Code in its own user settings).
 
 ## Requirements
 
