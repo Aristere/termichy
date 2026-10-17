@@ -109,7 +109,8 @@ const scan = (line: string, start: string, e: string, stops: number[] = []) => {
     else if (ch === '"' || ch === "'") q = ch
     else if (ch.trim()) {
       word = /\w/.test(ch) ? (/\w/.test(line[i - 1] ?? '') ? word + ch : ch) : ''
-      prev = ch
+      // `a++ / 2` divides: a ++ or -- ends a value, as ")" does.
+      prev = (ch === '+' || ch === '-') && line[i - 1] === ch ? ')' : ch
     }
   }
   while (s < stops.length) at.push(comment ? 1 : q ? 2 : kindOf(mode)), s++
@@ -119,7 +120,11 @@ const scan = (line: string, start: string, e: string, stops: number[] = []) => {
 // Soft-wraps one line to `width` cells, at the last space that leaves the row at least half full, else mid-word.
 // Continuation rows are indented past the line's own indent, so code keeps its shape; `at` is each row's offset.
 const wrapLine = (line: string, width: number) => {
-  const chars = Array.from(line)
+  // A line of one-cell characters (most are) is wrapped on string offsets, skipping the per-character walk that a
+  // 4 MiB log feels on every resize.
+  const narrow = !/[\u0300-\u036f\u1100-\uffff]/.test(line)
+  if (narrow && line.length <= width) return [{ at: 0, text: line }]
+  const chars = narrow ? line.split('') : Array.from(line)
   const lead = line.length - line.trimStart().length
   const pad = ' '.repeat(Math.min(lead + 2, Math.floor(width / 2)))
   const rows: { at: number; text: string }[] = []
@@ -209,8 +214,11 @@ const WIDE: [number, number][] = [
   [0x27b0, 0x27b0], [0x27bf, 0x27bf], [0x2b1b, 0x2b1c], [0x2b50, 0x2b50], [0x2b55, 0x2b55],
   [0x1f004, 0x1f004], [0x1f0cf, 0x1f0cf], [0x1f18e, 0x1f18e], [0x1f191, 0x1f19a], [0x1f200, 0x1f251], [0x1f300, 0x1faff], [0x20000, 0x3fffd],
 ]
+// U+FE0F asks for the emoji form, two cells wide, so it adds the cell its one-cell base (❤, ✔) lacks.
 const cells = (cp: number) =>
-  (cp >= 0x300 && cp <= 0x36f) || (cp >= 0x200b && cp <= 0x200f) || (cp >= 0xfe00 && cp <= 0xfe0f)
+  cp === 0xfe0f
+    ? 1
+    : (cp >= 0x300 && cp <= 0x36f) || (cp >= 0x200b && cp <= 0x200f) || (cp >= 0xfe00 && cp <= 0xfe0e)
     ? 0
     : cp >= 0x1100 && WIDE.some(([lo, hi]) => cp >= lo && cp <= hi)
       ? 2
@@ -610,8 +618,9 @@ export const register: Register = on => {
       // A narrow box drops "(press to close)" before the title would wrap.
       const closeHint = cols - 6 - 4 - 17 >= 6
       // With no footer to say so, a file cut at 4 MiB says it in the title.
-      const cutMark = made.cut && !footer ? ' · cut' : ''
-      const title = fit(cleanName(chosen), Math.max(1, cols - 6 - 4 - (closeHint ? 17 : 0) - cutMark.length)) + cutMark
+      const titleW = cols - 6 - 4 - (closeHint ? 17 : 0)
+      const cutMark = made.cut && !footer && titleW - 6 >= 1 ? ' · cut' : ''
+      const title = fit(cleanName(chosen), Math.max(1, titleW - cutMark.length)) + cutMark
 
       return (
         <Box flexDirection="column">
