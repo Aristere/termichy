@@ -1649,6 +1649,19 @@ describe('round 9', () => {
     expect(bar(v.box).at(-1)).toBe('█')
   })
 
+  test('the thumb is one box for any file length, so Terminal.app shows one bar and not a stack', async ($, on) => {
+    install(on, { 'mid.txt': file(Array.from({ length: 40 }, (_, i) => `row ${i + 1}`).join('\n')), 'long.txt': long() })
+    const { ui, read } = await open($, 40, 20)
+    for (const name of ['mid.txt', 'long.txt']) {
+      await ui.press({ key: K(name) })
+      for (const jump of [undefined, 'jump-end']) {
+        if (jump) await ui.press({ key: jump })
+        const cells = bar((await read()).box)
+        expect(cells.filter(c => c === '█'), `${name} ${jump ?? 'top'}`).toHaveLength(1)
+      }
+    }
+  })
+
   test('the scrollbar takes a column from the text, and a file that fits has none', async ($, on) => {
     const line = 'x'.repeat(200)
     install(on, { 'tall.txt': file(Array.from({ length: 40 }, () => line).join('\n')), 'short.txt': file(line) })

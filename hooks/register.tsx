@@ -799,9 +799,8 @@ export const register: Register = on => {
           await update($, tick, n => n + 1)
         }
       }
-      // The thumb's length is the share of the file in view, its place the share above it; a cell pressed opens the file
-      // that far down.
-      const thumb = Math.max(1, Math.round((previewRoom * previewRoom) / Math.max(1, textRows.length)))
+      // One cell marks that the file scrolls and where the window is; a cell pressed opens the file that far down.
+      const thumb = 1
       // Rounded down, and a press rounded up, so the thumb takes the last cell only at the end and sits on the cell pressed.
       // Products before quotients: 15 / 22 * 330 is 224.99999999999997, and the thumb lit the cell above.
       const thumbAt = pMax ? Math.floor((pTop * (previewRoom - thumb)) / pMax) : 0
