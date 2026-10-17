@@ -158,7 +158,9 @@ const layoutText = (made: Loaded, width: number): TextRow[] => {
   made.lines.forEach((line, k) => {
     const parts = wrapLine(line, width)
     const mode = made.modes[k] ?? ''
-    const later = parts.length > 1 ? scan(line, mode, made.ext, parts.slice(1).map(p => p.at)).at : []
+    // A line with no quote, slash, star or hash keeps its starting mode throughout, so it needs no scan.
+    const plain = !/["'`/*#\\]/.test(line)
+    const later = parts.length < 2 ? [] : plain ? parts.map(() => kindOf(mode)) : scan(line, mode, made.ext, parts.slice(1).map(p => p.at)).at
     parts.forEach((p, j) =>
       // Code drops empty lines, so a blank one is drawn as a space and keeps its row.
       out.push({ line: k, n: made.gutter && j === 0 ? k + 1 : 0, text: p.text || ' ', kind: j ? later[j - 1] ?? 0 : kindOf(mode) }),
