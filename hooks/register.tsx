@@ -38,48 +38,127 @@ const OPAQUE = new Set([
 const sizes = new Map<string, { w: number; h: number } | null>()
 // A PNG is up to 2.7 MB of base64, so only the last few previewed stay.
 const pngs = new Map<string, string | null>()
-// The lines of the previewed file, so a wheel tick slices them instead of re-reading the file. A 4 MiB log is
-// over 100 MB of lines, so only two stay.
-type Loaded = { rows: string[]; kinds: Kind[]; opaque: string; cut: boolean; gutter: boolean }
+// The lines of the previewed file and the mode each starts in, so a wheel tick slices them instead of re-reading
+// the file. A 4 MiB log is over 100 MB of lines, so only two stay.
+type Loaded = { lines: string[]; modes: string[]; ext: string; opaque: string; cut: boolean; gutter: boolean }
 const loaded = new Map<string, Loaded>()
+// One drawn row of a text preview: the line it belongs to, its number in the gutter (0 on a continuation row), its
+// text and what it starts inside of.
+type TextRow = { line: number; n: number; text: string; kind: Kind }
+const wraps = new Map<string, TextRow[]>()
 
 // Code colours each line on its own, so a line inside a block comment or a multi-line string comes out coloured
-// as code. This finds the lines that start inside one (/* */, JS template literals, Python triple quotes); they
-// are drawn plain instead, dim for a comment.
+// as code. `scan` follows /* */, JS template literals and regexes, Go raw strings and Python triple quotes, so the
+// rows that start inside a comment or string are drawn plain instead, dim for a comment.
 type Kind = 0 | 1 | 2
 const C_LIKE = new Set('js mjs cjs ts tsx jsx css scss less c h cc cpp hpp java kt swift go rs cs dart php'.split(' '))
-const BACKTICK = new Set('js mjs cjs ts tsx jsx go'.split(' '))
-const kindsOf = (lines: string[], e: string): Kind[] => {
+const JS = new Set('js mjs cjs ts tsx jsx'.split(' '))
+// After one of these a "/" starts a regex literal, which can hold "/*" or a backtick; anywhere else it divides.
+const REGEX_PREV = '(,=:[!&|?{};+-*%<>~^'
+const REGEX_WORDS = new Set('return typeof case do else in of new delete void throw yield await'.split(' '))
+const kindOf = (mode: string): Kind => (mode === '*/' ? 1 : mode ? 2 : 0)
+// Scans one line from the mode it starts in ('' code, '*/', '`', '"""', "'''"): the mode it ends in, and the kind at each
+// of `stops` (ascending offsets into the line).
+const scan = (line: string, start: string, e: string, stops: number[] = []) => {
   const c = C_LIKE.has(e)
-  const tick = BACKTICK.has(e)
+  const js = JS.has(e)
+  const go = e === 'go'
   const py = e === 'py'
-  const out: Kind[] = []
-  let mode = ''
-  for (const line of lines) {
-    out.push(mode === '' ? 0 : mode === '*/' ? 1 : 2)
-    let q = ''
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i]
-      if (mode) {
-        if (mode !== '*/' && ch === '\\') i++
-        else if (line.startsWith(mode, i)) {
-          i += mode.length - 1
-          mode = ''
-        }
-      } else if (q) {
-        if (ch === '\\') i++
-        else if (ch === q) q = ''
-      } else if ((c && line.startsWith('//', i)) || (py && ch === '#')) break
-      else if (c && line.startsWith('/*', i)) {
-        mode = '*/'
-        i++
-      } else if (py && (line.startsWith('"""', i) || line.startsWith("'''", i))) {
-        mode = line.slice(i, i + 3)
-        i += 2
-      } else if (tick && ch === '`') mode = '`'
-      else if (ch === '"' || ch === "'") q = ch
+  const at: Kind[] = []
+  let mode = start
+  let q = ''
+  let prev = ''
+  let word = ''
+  let s = 0
+  let i = 0
+  let comment = false
+  for (; i < line.length; i++) {
+    while (s < stops.length && (stops[s] ?? 0) <= i) at.push(q ? 2 : kindOf(mode)), s++
+    const ch = line[i] ?? ''
+    if (mode) {
+      // A Go raw string has no escapes, nor does a comment.
+      if (mode !== '*/' && !go && ch === '\\') i++
+      else if (line.startsWith(mode, i)) {
+        i += mode.length - 1
+        mode = ''
+        prev = ch
+      }
+    } else if (q) {
+      if (ch === '\\') i++
+      else if (ch === q) (q = ''), (prev = ch)
+    } else if ((c && e !== 'css' && line.startsWith('//', i)) || (py && ch === '#')) {
+      comment = true
+      break
+    } else if (js && ch === '/' && line[i + 1] !== '*' && (prev === '' || REGEX_PREV.includes(prev) || REGEX_WORDS.has(word))) {
+      // Skip the regex: to the next "/" that is neither escaped nor inside a [class].
+      for (let cls = false; ++i < line.length; ) {
+        if (line[i] === '\\') i++
+        else if (line[i] === '[') cls = true
+        else if (line[i] === ']') cls = false
+        else if (line[i] === '/' && !cls) break
+      }
+      prev = '/'
+      word = ''
+    } else if (c && line.startsWith('/*', i)) {
+      mode = '*/'
+      i++
+    } else if (py && (line.startsWith('"""', i) || line.startsWith("'''", i))) {
+      mode = line.slice(i, i + 3)
+      i += 2
+    } else if ((js || go) && ch === '`') mode = '`'
+    else if (ch === '"' || ch === "'") q = ch
+    else if (ch.trim()) {
+      word = /\w/.test(ch) ? (/\w/.test(line[i - 1] ?? '') ? word + ch : ch) : ''
+      prev = ch
     }
   }
+  while (s < stops.length) at.push(comment ? 1 : q ? 2 : kindOf(mode)), s++
+  return { mode, at }
+}
+
+// Soft-wraps one line to `width` cells, at the last space that leaves the row at least half full, else mid-word.
+// Continuation rows are indented past the line's own indent, so code keeps its shape; `at` is each row's offset.
+const wrapLine = (line: string, width: number) => {
+  const chars = Array.from(line)
+  const lead = line.length - line.trimStart().length
+  const pad = ' '.repeat(Math.min(lead + 2, Math.floor(width / 2)))
+  const rows: { at: number; text: string }[] = []
+  let start = 0
+  let offset = 0
+  while (start < chars.length || rows.length === 0) {
+    const room = rows.length ? width - pad.length : width
+    let end = start
+    let used = 0
+    while (end < chars.length && used + cells(chars[end]!.codePointAt(0)!) <= room) used += cells(chars[end++]!.codePointAt(0)!)
+    if (end === start && end < chars.length) end++
+    if (end < chars.length) {
+      for (let k = end - 1; k > start + (end - start) / 2; k--) {
+        if (chars[k] === ' ') {
+          end = k + 1
+          break
+        }
+      }
+    }
+    const piece = chars.slice(start, end).join('')
+    rows.push({ at: offset, text: (rows.length ? pad : '') + piece })
+    offset += piece.length
+    start = end
+    if (start >= chars.length) break
+  }
+  return rows
+}
+
+const layoutText = (made: Loaded, width: number): TextRow[] => {
+  const out: TextRow[] = []
+  made.lines.forEach((line, k) => {
+    const parts = wrapLine(line, width)
+    const mode = made.modes[k] ?? ''
+    const later = parts.length > 1 ? scan(line, mode, made.ext, parts.slice(1).map(p => p.at)).at : []
+    parts.forEach((p, j) =>
+      // Code drops empty lines, so a blank one is drawn as a space and keeps its row.
+      out.push({ line: k, n: made.gutter && j === 0 ? k + 1 : 0, text: p.text || ' ', kind: j ? later[j - 1] ?? 0 : kindOf(mode) }),
+    )
+  })
   return out
 }
 const remember = <V,>(map: Map<string, V>, key: string, value: V, max: number) => {
@@ -419,15 +498,20 @@ export const register: Register = on => {
       const dim = sizes.get(imgKey)
       const png = pngs.get(imgKey)
 
-      // What the box holds: the file's lines, or (opaque) the reason no preview is drawn.
-      let made: Loaded = { rows: [], kinds: [], opaque: '', cut: false, gutter: false }
+      // What the box holds: the file's lines wrapped to the box, or (opaque) the reason no preview is drawn.
+      let made: Loaded = { lines: [], modes: [], ext: '', opaque: '', cut: false, gutter: false }
+      const sig = `${chosen}|${st?.mtimeMs}|${st?.size}|${statErr}`
       if (boxed && !isImage) {
-        const sig = `${chosen}|${st?.mtimeMs}|${st?.size}|${statErr}`
         made = loaded.get(sig) ?? (await loadText($, chosen, st, statErr))
         // A refusal is asked again each time: a chmod changes neither mtime nor size.
         if (!made.opaque.startsWith('Cannot read')) remember(loaded, sig, made, 2)
       }
-      const textRows = made.rows
+      // Line numbers take the gutter; the rest of the box's inner width (cols - 4) holds the wrapped rows.
+      const gutterW = made.gutter ? String(made.lines.length).length + 1 : 0
+      const lineW = Math.max(1, cols - 4 - gutterW)
+      const wrapKey = `${sig}|${lineW}`
+      const textRows = wraps.get(wrapKey) ?? layoutText(made, lineW)
+      if (made.lines.length) remember(wraps, wrapKey, textRows, 2)
       const opaque = made.opaque
 
       const pathRows = chunk(cleanName(real), cols - 6)
@@ -506,22 +590,18 @@ export const register: Register = on => {
         // Not `cmd /c start`: cmd parses the name again, and a file named `a&calc` would run calc.
         launch([['open', arg], ['xdg-open', arg], ['explorer', real]], 'Opened', 'No app could open this file')
 
-      const shownRange = `${pTop + 1}-${Math.min(textRows.length, pTop + previewRoom)}/${textRows.length}`
+      // The range names file lines, though the window moves by drawn rows.
+      const lastRow = textRows[Math.min(textRows.length, pTop + previewRoom) - 1]
+      const shownRange = `${(textRows[pTop]?.line ?? 0) + 1}-${(lastRow?.line ?? 0) + 1}/${made.lines.length}`
       const rangeW = Math.max(1, cols - 6 - 12)
       // A file past 4 MiB says so in the footer, in the long words where they fit.
       const range = fit(!made.cut ? shownRange : textCells(`${shownRange} · cut at 4 MiB`) <= rangeW ? `${shownRange} · cut at 4 MiB` : `${shownRange} · cut`, rangeW)
-      // Line numbers, then each run of lines of one kind: code through Code, comment and string interiors plain.
-      // Code cuts a long line at the edge; plain lines are cut here to the same width.
-      const gutterW = made.gutter ? String(textRows.length).length + 1 : 0
-      const lineW = Math.max(1, cols - 4 - gutterW)
-      const runs: { kind: Kind; from: number; lines: string[] }[] = []
-      for (let i = pTop; i < Math.min(textRows.length, pTop + previewRoom); i++) {
-        const kind = made.kinds[i] ?? 0
+      // Each run of rows of one kind: code through Code, comment and string interiors plain.
+      const runs: { kind: Kind; from: number; rows: TextRow[] }[] = []
+      for (const row of textRows.slice(pTop, pTop + previewRoom)) {
         const last = runs[runs.length - 1]
-        // Code drops empty lines, so a blank one is drawn as a space and keeps its row.
-        const line = textRows[i] || ' '
-        if (last && last.kind === kind) last.lines.push(line)
-        else runs.push({ kind, from: i, lines: [line] })
+        if (last && last.kind === row.kind) last.rows.push(row)
+        else runs.push({ kind: row.kind, from: runs.reduce((n, r) => n + r.rows.length, pTop), rows: [row] })
       }
       const jump = async (to: number) => {
         g.pTop = to
@@ -529,7 +609,9 @@ export const register: Register = on => {
       }
       // A narrow box drops "(press to close)" before the title would wrap.
       const closeHint = cols - 6 - 4 - 17 >= 6
-      const title = fit(cleanName(chosen), Math.max(1, cols - 6 - 4 - (closeHint ? 17 : 0)))
+      // With no footer to say so, a file cut at 4 MiB says it in the title.
+      const cutMark = made.cut && !footer ? ' · cut' : ''
+      const title = fit(cleanName(chosen), Math.max(1, cols - 6 - 4 - (closeHint ? 17 : 0) - cutMark.length)) + cutMark
 
       return (
         <Box flexDirection="column">
@@ -604,7 +686,7 @@ export const register: Register = on => {
                 <Box flexDirection="row">
                   {gutterW > 0 && (
                     <Text dimColor>
-                      {runs.flatMap(r => r.lines.map((_, j) => `${String(r.from + j + 1).padStart(gutterW - 1)} `)).join('\n')}
+                      {runs.flatMap(r => r.rows.map(x => `${x.n ? String(x.n) : ''}`.padStart(gutterW - 1) + ' ')).join('\n')}
                     </Text>
                   )}
                   <Box flexDirection="column" width={lineW}>
@@ -612,14 +694,14 @@ export const register: Register = on => {
                       r.kind === 0 ? (
                         <Code
                           key={`run-${r.from}`}
-                          source={r.lines.join('\n')}
+                          source={r.rows.map(x => x.text).join('\n')}
                           language={LANG[ext(chosen)]}
                           path={cleanName(chosen)}
                           wrap="truncate-end"
                         />
                       ) : (
                         <Text key={`run-${r.from}`} dimColor={r.kind === 1}>
-                          {r.lines.map(l => fit(l, lineW)).join('\n')}
+                          {r.rows.map(x => x.text).join('\n')}
                         </Text>
                       ),
                     )}
@@ -648,11 +730,11 @@ export const register: Register = on => {
 
 // Reads one file for the box: wrapped rows, or the reason it has none. Never reads a pipe or device, which can block.
 async function loadText($: any, path: string, st: Stat | undefined, statErr: string): Promise<Loaded> {
-  const none = (opaque: string): Loaded => ({ rows: [], kinds: [], opaque, cut: false, gutter: false })
+  const none = (opaque: string): Loaded => ({ lines: [], modes: [], ext: '', opaque, cut: false, gutter: false })
   if (!st) return none(statErr.startsWith('ENOENT') ? 'File not found' : statErr ? `Cannot read this file (${clean(statErr)})` : 'Cannot read this file')
   if (st.kind !== 'file') return none(st.isLink && !st.realPath ? 'Broken link' : 'Not a regular file')
   if (OPAQUE.has(ext(path))) return none('No preview in the terminal')
-  if (st.size === 0) return { rows: ['(empty file)'], kinds: [0], opaque: '', cut: false, gutter: false }
+  if (st.size === 0) return { lines: ['(empty file)'], modes: [''], ext: '', opaque: '', cut: false, gutter: false }
   let text: string | undefined
   let cut = false
   try {
@@ -673,7 +755,13 @@ async function loadText($: any, path: string, st: Stat | undefined, statErr: str
   if (text.includes('\0')) return none('Binary file')
   const lines = text.replace(/\r\n/g, '\n').split('\n')
   if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop()
-  // A drawing takes 100,000 characters in all, so a minified line is kept to its first thousand.
-  const rows = lines.map(l => clean(l.slice(0, 1000).replace(/\t/g, '  ')))
-  return { rows, kinds: kindsOf(lines, ext(path)), opaque: '', cut, gutter: true }
+  const rows = lines.map(l => clean(l.replace(/\t/g, '  ')))
+  const e = ext(path)
+  const modes: string[] = []
+  let mode = ''
+  for (const line of rows) {
+    modes.push(mode)
+    mode = scan(line, mode, e).mode
+  }
+  return { lines: rows, modes, ext: e, opaque: '', cut, gutter: true }
 }

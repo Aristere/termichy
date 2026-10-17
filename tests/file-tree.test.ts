@@ -1297,13 +1297,16 @@ describe('code preview', () => {
     expect((await read()).cursor).toBe('long.txt')
   })
 
-  test('a 200 KB one-line minified file stays under the 100,000 characters a drawing takes', async ($, on) => {
+  test('a 200 KB one-line minified file wraps, stays under the 100,000 characters a drawing takes, and scrolls to its end', async ($, on) => {
     install(on, { 'min.js': file('var a=1;'.repeat(25000)) })
     const { ui, read } = await open($, 60, 30)
     await ui.press({ key: K('min.js') })
     const v = await read()
     expect(textOf(v.top).length).toBeLessThan(100000)
-    expect(v.source?.split('\n')).toHaveLength(1)
+    expect(v.range).toBe('1-1/1')
+    expect(v.codeLines).toBeGreaterThan(1)
+    await ui.press({ key: 'jump-end' })
+    expect((await read()).source?.split('\n').pop()?.trimEnd()).toMatch(/var a=1;$/)
   })
 
   test('the range counts the file\'s lines, not wrapped rows', async ($, on) => {
@@ -1374,5 +1377,64 @@ describe('round 5', () => {
     const v = await read()
     expect(v.box).toBeDefined()
     expect(v.boxText ?? '', 'the cut is mentioned somewhere in the box').toMatch(/cut|first/)
+  })
+})
+
+describe('wrapping', () => {
+  const rowsOf = (box: El | undefined) => {
+    const row = box ? all(box).find(e => e.type === 'Box' && e.props?.flexDirection === 'row' && !all(e).some(k => k.props?.key === 'jump-top')) : undefined
+    const kids = (row?.children ?? []).filter(isEl)
+    const gutter = kids.length > 1 ? textOf(kids[0]).split('\n') : []
+    const runs = (kids[kids.length - 1]?.children ?? []).filter(isEl)
+    const lines = runs.flatMap(r => (r.type === 'Code' ? String(r.props?.source ?? '') : textOf(r)).split('\n').map(text => ({ text, as: r.type === 'Code' ? 'code' : r.props?.dimColor ? 'comment' : 'plain' })))
+    return { gutter, lines }
+  }
+
+  test('a long line wraps inside the box, at spaces, and none of it is lost', async ($, on) => {
+    const words = Array.from({ length: 60 }, (_, i) => `word${i}`).join(' ')
+    const line = `    const text = ${words}`
+    install(on, { 'w.ts': file(`${line}\nconst after = 1`) })
+    const cols = 50
+    const { ui, read } = await open($, cols, 40)
+    await ui.press({ key: K('w.ts') })
+    const { gutter, lines } = rowsOf((await read()).box)
+    const mine = lines.slice(0, -1)
+    expect(mine.length).toBeGreaterThan(3)
+    // Every row fits the box beside the gutter.
+    for (const l of lines) expect(width(l.text) + (gutter[0]?.length ?? 0)).toBeLessThanOrEqual(cols - 4)
+    // Only the first row is numbered; continuation rows are indented past the line's own indent.
+    expect(gutter.map(g => g.trim())).toEqual(['1', ...mine.slice(1).map(() => ''), '2'])
+    for (const l of mine.slice(1)) expect(l.text.startsWith('      ')).toBe(true)
+    // Rows break after a space, never inside a word, and together they are the whole line.
+    for (const l of mine.slice(0, -1)) expect(l.text.endsWith(' ')).toBe(true)
+    expect(mine.map((l, i) => (i ? l.text.trimStart() : l.text)).join('')).toBe(line)
+  })
+
+  test('a continuation row that starts inside a string or a line comment is drawn plain, not highlighted', async ($, on) => {
+    const long = Array.from({ length: 30 }, () => 'function const return').join(' ')
+    install(on, { 's.ts': file(`const s = "${long}"\nconst t = 1 // ${long}\nconst u = 2`) })
+    const { ui, read } = await open($, 50, 60)
+    await ui.press({ key: K('s.ts') })
+    const { gutter, lines } = rowsOf((await read()).box)
+    const starts = gutter.map((g, i) => (g.trim() ? i : -1)).filter(i => i >= 0)
+    const [s1 = 0, s2 = 0, s3 = 0] = starts
+    expect(lines[s1]?.as).toBe('code')
+    for (const l of lines.slice(s1 + 1, s2)) expect(l.as).toBe('plain')
+    expect(lines[s2]?.as).toBe('code')
+    for (const l of lines.slice(s2 + 1, s3)) expect(l.as).toBe('comment')
+    expect(lines[s3]?.as).toBe('code')
+  })
+
+  test('a window that starts on a continuation row says which line it is in', async ($, on) => {
+    const long = Array.from({ length: 80 }, (_, i) => `w${i}`).join(' ')
+    install(on, { 'r.txt': file(`${long}\n${long}\nshort`) })
+    const rows = 12
+    const { ui, read } = await open($, 40, rows)
+    await ui.press({ key: K('r.txt') })
+    const v = await read()
+    const kids = (v.top.children ?? []).filter(isEl)
+    const boxRow = height(kids[0]) + height(kids[1]) + 2
+    await scroll($, 3, rows, boxRow)
+    expect((await read()).range).toMatch(/^1-\d\/3$/)
   })
 })
