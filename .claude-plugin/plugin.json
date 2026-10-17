@@ -1,7 +1,7 @@
 {
   "name": "file-tree",
   "displayName": "File Tree",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "icon": "./assets/icon.png",
   "description": "A project file tree pane inside Claude Code, the same in every terminal.",
   "author": {
@@ -9,6 +9,8 @@
   },
   "homepage": "https://github.com/Aristere/termichy",
   "repository": "https://github.com/Aristere/termichy",
+  "documentationUrl": "https://github.com/Aristere/termichy#readme",
+  "supportUrl": "https://github.com/Aristere/termichy/issues",
   "license": "MIT",
   "keywords": [
     "file-tree",
