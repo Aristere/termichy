@@ -190,6 +190,9 @@ const all = (x: unknown, out: El[] = []): El[] => {
 }
 
 const PANE = 'file-tree'
+// The text preview's row is gutter, text column, then the scrollbar's column of `sb-` cells when the file overflows.
+const isBar = (x: El) => all(x).some(k => String(k.props?.key ?? '').startsWith('sb-'))
+const textColumn = (kids: El[]) => kids.find(k => k.type === 'Box' && !isBar(k))
 // Row keys as register.tsx spells them; the test presses rows by path through this.
 const K = (path: string) =>
   `r:${encodeURIComponent(path.replace(/\ufffe|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, c => `\ufffe${c.charCodeAt(0).toString(16).padStart(4, '0')}`))}`
@@ -1244,8 +1247,8 @@ describe('code preview', () => {
   const preview = (box: El | undefined) => {
     const row = box ? all(box).find(e => e.type === 'Box' && e.props?.flexDirection === 'row' && !all(e).some(k => k.props?.key === 'jump-top')) : undefined
     const kids = (row?.children ?? []).filter(isEl)
-    const gutter = kids.length > 1 ? textOf(kids[0]).split('\n').map(s => s.trim()) : []
-    const runs = (kids[kids.length - 1]?.children ?? []).filter(isEl).map(r => ({
+    const gutter = kids[0]?.type === 'Text' ? textOf(kids[0]).split('\n').map(s => s.trim()) : []
+    const runs = (textColumn(kids)?.children ?? []).filter(isEl).map(r => ({
       as: r.type === 'Code' ? 'code' : r.props?.dimColor ? 'comment' : 'plain',
       lines: (r.type === 'Code' ? String(r.props?.source ?? '') : textOf(r)).split('\n'),
     }))
@@ -1384,8 +1387,8 @@ describe('wrapping', () => {
   const rowsOf = (box: El | undefined) => {
     const row = box ? all(box).find(e => e.type === 'Box' && e.props?.flexDirection === 'row' && !all(e).some(k => k.props?.key === 'jump-top')) : undefined
     const kids = (row?.children ?? []).filter(isEl)
-    const gutter = kids.length > 1 ? textOf(kids[0]).split('\n') : []
-    const runs = (kids[kids.length - 1]?.children ?? []).filter(isEl)
+    const gutter = kids[0]?.type === 'Text' ? textOf(kids[0]).split('\n') : []
+    const runs = (textColumn(kids)?.children ?? []).filter(isEl)
     const lines = runs.flatMap(r => (r.type === 'Code' ? String(r.props?.source ?? '') : textOf(r)).split('\n').map(text => ({ text, as: r.type === 'Code' ? 'code' : r.props?.dimColor ? 'comment' : 'plain' })))
     return { gutter, lines }
   }
@@ -1590,6 +1593,137 @@ describe('round 8', () => {
     for (const cols of [80, 60, 140, 120]) {
       await ui.redraw(props(cols, rows))
       expect((await read()).range?.split('-')[0], `cols ${cols}`).toBe(before)
+    }
+  })
+})
+
+describe('round 9', () => {
+  const bar = (box: El | undefined) =>
+    (box ? all(box) : []).filter(e => String(e.props?.key ?? '').startsWith('sb-')).map(e => String(e.props?.label))
+  const ring = (on: On) => on('ui.focus', async () => ({}))
+  const tab = ($: Engine, element: string) =>
+    $.ui.focus({ component: 'Pane', requestId: PANE, plugin: PANE, element, origin: { kind: 'person' } })
+  const long = () => file(Array.from({ length: 300 }, (_, i) => `row ${i + 1}`).join('\n'))
+
+  test('a file taller than the box gets a scrollbar whose thumb follows the window', async ($, on) => {
+    install(on, { 'n.txt': long() })
+    const rows = 20
+    const { ui, read } = await open($, 40, rows)
+    await ui.press({ key: K('n.txt') })
+    let v = await read()
+    const cells = bar(v.box)
+    expect(cells.length).toBe(v.codeLines)
+    expect(cells[0]).toBe('█')
+    expect(cells[cells.length - 1]).toBe('│')
+    expect(height(v.top)).toBe(rows + 1)
+    await ui.press({ key: 'jump-end' })
+    v = await read()
+    expect(bar(v.box)[0]).toBe('│')
+    expect(bar(v.box).at(-1)).toBe('█')
+  })
+
+  test('the scrollbar takes a column from the text, and a file that fits has none', async ($, on) => {
+    const line = 'x'.repeat(200)
+    install(on, { 'tall.txt': file(Array.from({ length: 40 }, () => line).join('\n')), 'short.txt': file(line) })
+    const cols = 40
+    const { ui, read } = await open($, cols, 30)
+    await ui.press({ key: K('tall.txt') })
+    let v = await read()
+    expect(bar(v.box).length).toBeGreaterThan(0)
+    // Gutter "NN " is 3 cells, the bar 1: 40 - 4 - 3 - 1.
+    expect(Math.max(...(v.source ?? '').split('\n').map(width))).toBe(cols - 4 - 3 - 1)
+    await ui.press({ key: K('short.txt') })
+    v = await read()
+    expect(bar(v.box)).toHaveLength(0)
+    expect(Math.max(...(v.source ?? '').split('\n').map(width))).toBe(cols - 4 - 2)
+  })
+
+  test('pressing a scrollbar cell opens the file that far down', async ($, on) => {
+    install(on, { 'n.txt': long() })
+    const { ui, read } = await open($, 40, 20)
+    await ui.press({ key: K('n.txt') })
+    const n = bar((await read()).box).length
+    await ui.press({ key: `sb-${n - 1}` })
+    expect((await read()).range).toMatch(/-300\/300$/)
+    await ui.press({ key: `sb-${Math.floor((n - 1) / 2)}` })
+    const mid = Number((await read()).range?.split('-')[0])
+    expect(mid).toBeGreaterThan(100)
+    expect(mid).toBeLessThan(200)
+    await ui.press({ key: 'sb-0' })
+    expect((await read()).range).toMatch(/^1-/)
+  })
+
+  test('Tab into the preview: the arrows, Home/End and the wheel scroll the file; Tab again walks the tree', async ($, on) => {
+    ring(on)
+    install(on, { 'a.txt': file(), 'n.txt': long(), 'z.txt': file() })
+    const rows = 20
+    const { ui, read } = await open($, 50, rows)
+    await ui.press({ key: K('n.txt') })
+    expect((await read()).hint).toContain('Tab preview')
+    // Tab from the cursor's row lands on the next row; the plugin turns it into the preview.
+    await tab($, K('z.txt'))
+    let v = await read()
+    expect(v.hint).toContain('↑↓ scroll')
+    expect(v.cursor).toBe('n.txt')
+    await scroll($, 1, rows)
+    await scroll($, 1, rows)
+    expect((await read()).range).toMatch(/^3-/)
+    // A wheel over the tree scrolls the file too while the keys are in the preview.
+    await scroll($, 3, rows, 2)
+    expect((await read()).range).toMatch(/^6-/)
+    await scroll($, rows + 1, rows)
+    expect((await read()).range).toMatch(/-300\/300$/)
+    await scroll($, -(rows + 1), rows)
+    expect((await read()).range).toMatch(/^1-/)
+    expect((await read()).cursor).toBe('n.txt')
+    // Tab out of the title: back on the cursor's row, and the arrows walk the tree again.
+    await tab($, 'sb-0')
+    v = await read()
+    expect(v.hint).toContain('Tab preview')
+    await scroll($, 1, rows)
+    expect((await read()).cursor).toBe('z.txt')
+  })
+
+  test('a press on a row hands the keys back to the tree', async ($, on) => {
+    ring(on)
+    install(on, { 'a.txt': file(), 'n.txt': long() })
+    const rows = 20
+    const { ui, read } = await open($, 50, rows)
+    await ui.press({ key: K('n.txt') })
+    await ui.press({ key: 'jump-end' })
+    expect((await read()).hint).toContain('↑↓ scroll')
+    await ui.press({ key: K('a.txt') })
+    await scroll($, 1, rows)
+    const v = await read()
+    expect(v.hint).toContain('↑↓ move')
+    expect(v.cursor).toBe('n.txt')
+  })
+
+  test('with no text preview Tab walks the rows as before', async ($, on) => {
+    ring(on)
+    install(on, { 'a.txt': file(), 'b.mp4': file('x'), 'c.txt': file() })
+    const { ui, read } = await open($)
+    await ui.press({ key: K('b.mp4') })
+    await tab($, K('c.txt'))
+    const v = await read()
+    expect(v.cursor).toBe('c.txt')
+    expect(v.hint).not.toContain('scroll')
+  })
+
+  test('Tab between tree and preview keeps the hint and the box the same height', async ($, on) => {
+    ring(on)
+    install(on, { 'a.txt': file(), 'n.txt': long() })
+    for (const cols of [20, 30, 47, 60]) {
+      const { ui, read } = await open($, cols, 20)
+      await ui.press({ key: K('n.txt') })
+      await tab($, K('a.txt'))
+      const before = await read()
+      await tab($, K('a.txt'))
+      const after = await read()
+      expect(before.hint.split('\n').length, `cols ${cols}`).toBe(after.hint.split('\n').length)
+      expect(before.codeLines, `cols ${cols}`).toBe(after.codeLines)
+      expect(height(after.top), `cols ${cols}`).toBe(21)
+      await ui.unmount?.()
     }
   })
 })

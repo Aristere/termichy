@@ -28,6 +28,12 @@ type Geo = {
   anchor?: { sig: string; width: number; line: number; at: number }
 }
 const geos = new Map<string, Geo>()
+// Tab from the tree puts the arrows, Home/End and the wheel on the text preview, with the ring resting on the box's
+// title; any other move of the ring (Tab again, a click) hands them back. `textShown`: the last drawing had a text preview.
+let inPreview = false
+let textShown = false
+const PREVIEW_KEYS = new Set(['close-preview', 'jump-top', 'jump-end'])
+const isPreviewKey = (key: string) => PREVIEW_KEYS.has(key) || key.startsWith('sb-')
 // Renders run one at a time: one slowed by sips that finished after a newer one left the engine holding
 // buttons from a drawing it no longer showed, and presses on them did nothing.
 let drawing: Promise<unknown> = Promise.resolve()
@@ -377,18 +383,17 @@ export const register: Register = on => {
     // no surface, and walking the cursor is the move that can't scroll a preview the person isn't looking at.
     const fits = [...geos.values()].filter(x => x.bodyRows === e.bodyRows)
     const g = fits.every(x => x.previewFrom === fits[0]?.previewFrom) ? fits[0] : undefined
-    // A wheel over the preview box scrolls the box (on every surface it could be); everywhere else it walks the tree.
-    if (g && e.pointer && e.pointer.row >= g.previewFrom) {
-      for (const x of fits) x.pTop = Math.max(0, Math.min(x.pMax, x.pTop + e.by))
-      await update($, tick, n => n + 1).catch(() => undefined)
-      return {}
-    }
     // Home and End ask for contentRows, which the padding keeps near bodyRows, far short of a long list's ends.
     const ends = !e.pointer && Math.abs(e.by) >= e.contentRows
-    // Page keys (bodyRows) scroll an open text preview by its height, since nothing else reaches the middle of a long
-    // file from the keyboard, and do nothing at its ends; with no text preview they page the tree.
-    if (g && !e.pointer && !ends && Math.abs(e.by) === e.bodyRows && g.page > 0) {
-      for (const x of fits) x.pTop = Math.max(0, Math.min(x.pMax, x.pTop + Math.sign(e.by) * Math.max(1, x.page - 1)))
+    const paging = !e.pointer && !ends && Math.abs(e.by) === e.bodyRows
+    // The preview scrolls (on every surface it could be) under a wheel over the box, under the page keys while a text
+    // preview is open, and under every key and wheel once Tab has put the keys in it; elsewhere the cursor walks the tree.
+    const text = !!g && g.page > 0
+    if ((g && e.pointer && e.pointer.row >= g.previewFrom) || (text && (inPreview || paging))) {
+      for (const x of fits) {
+        const step = ends ? Math.sign(e.by) * x.pMax : paging ? Math.sign(e.by) * Math.max(1, x.page - 1) : e.by
+        x.pTop = Math.max(0, Math.min(x.pMax, x.pTop + step))
+      }
       await update($, tick, n => n + 1).catch(() => undefined)
       return {}
     }
@@ -403,8 +408,29 @@ export const register: Register = on => {
 
   // Tab and clicks move the engine's focus ring; the cursor follows it onto a row, so Enter and › agree.
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
+    const el = e.element ?? ''
+    const into = (yes: boolean) => {
+      if (inPreview === yes) return
+      inPreview = yes
+      void update($, tick, n => n + 1).catch(() => undefined)
+    }
+    // The plugin's own moves say where the keys are: on the title in the preview, on a row in the tree.
+    if (e.origin.kind !== 'person') {
+      const r = await next(e)
+      if (!r.deny) into(el === 'close-preview')
+      return r
+    }
+    // The event cannot tell Tab from a click, so a move to the row next to the cursor, or onto the box, is taken for
+    // Tab; a click there still presses what it hit, and the row and box presses put the keys where they belong.
+    const near = (p?: string) => p !== undefined && order.includes(p) && Math.abs(order.indexOf(p) - order.indexOf(at)) === 1
+    if ((!inPreview && textShown && (isPreviewKey(el) || near(pathOf(el)))) || (inPreview && el !== 'close-preview')) {
+      const entering = !inPreview
+      const r = await next({ ...e, element: entering ? 'close-preview' : rowKey(at) })
+      if (!r.deny) into(entering)
+      return r
+    }
     const r = await next(e)
-    const path = e.origin.kind === 'person' && e.element ? pathOf(e.element) : undefined
+    const path = pathOf(el)
     if (!r.deny && path !== undefined && path !== at && order.includes(path)) {
       at = path
       await update($, cursor, () => at).catch(() => undefined)
@@ -488,17 +514,18 @@ export const register: Register = on => {
       }
       if (!order.includes(at)) at = order[0] ?? ''
 
+      // A press on a row puts the cursor and the keys there; a click next to the cursor was first taken for Tab.
+      const pick = (path: string) => {
+        at = path
+        inPreview = false
+        void update($, cursor, () => path)
+        focusCursor($)
+      }
       const toggle = (path: string) =>
         update($, expanded, list =>
           list.includes(path) ? list.filter(p => p !== path) : [...list, path],
         )
 
-      const hint = `${order.indexOf(at) + 1}/${rows.length} · ↑↓ move · Enter open · PgUp/PgDn scroll preview · Esc back`
-      // Under 12 rows the hint keeps to one line, and under 6 it gives its row to the tree.
-      const hintRows = bodyRows >= 12 ? chunk(hint, cols - 1) : bodyRows >= 6 ? [fit(hint, cols - 1)] : []
-      // The box takes up to 60% and leaves the tree three rows (one in a small pane); title and border are its least.
-      const avail = bodyRows - hintRows.length
-      const maxBox = Math.max(3, Math.min(avail - (avail >= 10 ? 3 : 1), Math.max(4, Math.floor(bodyRows * 0.6))))
       // Under 14 columns a box's buttons cannot fit on one line, so the selection shows in the tree alone.
       const boxed = !!chosen && cols >= 14
       // "[ " and " ]" around a label inside the border and padding: cols - 8 cells for it.
@@ -536,13 +563,32 @@ export const register: Register = on => {
         // A refusal is asked again each time: a chmod changes neither mtime nor size.
         if (!made.opaque.startsWith('Cannot read')) remember(loaded, sig, made, 2)
       }
-      // Line numbers take the gutter; the rest of the box's inner width (cols - 4) holds the wrapped rows.
-      const gutterW = made.gutter ? String(made.lines.length).length + 1 : 0
-      const lineW = Math.max(1, cols - 4 - gutterW)
-      const wrapKey = `${sig}|${lineW}`
-      const textRows = wraps.get(wrapKey) ?? layoutText(made, lineW)
-      if (made.lines.length) remember(wraps, wrapKey, textRows, 2)
       const opaque = made.opaque
+      textShown = boxed && !isImage && !opaque
+      if (!textShown) inPreview = false
+
+      // Both hints are 45 cells, so Tab between tree and preview never changes the hint's rows and with them the box.
+      const keys = !textShown ? '↑↓ move · Enter open · Esc back' : inPreview ? '↑↓ scroll · Enter close · Tab tree · Esc back' : '↑↓ move · Enter open · Tab preview · Esc back'
+      const hint = `${order.indexOf(at) + 1}/${rows.length} · ${keys}`
+      // Under 12 rows the hint keeps to one line, and under 6 it gives its row to the tree.
+      const hintRows = bodyRows >= 12 ? chunk(hint, cols - 1) : bodyRows >= 6 ? [fit(hint, cols - 1)] : []
+      // The box takes up to 60% and leaves the tree three rows (one in a small pane); title and border are its least.
+      const avail = bodyRows - hintRows.length
+      const maxBox = Math.max(3, Math.min(avail - (avail >= 10 ? 3 : 1), Math.max(4, Math.floor(bodyRows * 0.6))))
+
+      // Line numbers take the gutter; the rest of the box's inner width (cols - 4) holds the wrapped rows, less a
+      // column for the scrollbar when the file is taller than the box.
+      const gutterW = made.gutter ? String(made.lines.length).length + 1 : 0
+      const fullW = Math.max(1, cols - 4 - gutterW)
+      const rowsAt = (w: number) => {
+        const got = wraps.get(`${sig}|${w}`) ?? layoutText(made, w)
+        if (made.lines.length) remember(wraps, `${sig}|${w}`, got, 3)
+        return got
+      }
+      // Every line takes a row at least, so only a short file needs laying out to know it fits.
+      const bar = textShown && fullW > 1 && (made.lines.length > maxBox - 3 || rowsAt(fullW).length > maxBox - 3)
+      const lineW = bar ? fullW - 1 : fullW
+      const textRows = rowsAt(lineW)
 
       const pathRows = chunk(cleanName(real), cols - 6)
       const headline = `${isImage ? (dim ? `${dim.w} × ${dim.h} px` : imaging.has(imgKey) ? 'measuring…' : 'size unknown') : opaque}${st && st.kind === 'file' ? `  ·  ${human(st.size)}` : ''}`
@@ -640,10 +686,18 @@ export const register: Register = on => {
         if (last && last.kind === row.kind) last.rows.push(row)
         else runs.push({ kind: row.kind, from: runs.reduce((n, r) => n + r.rows.length, pTop), rows: [row] })
       }
+      // A press on the scrollbar or a jump button scrolls there and puts the keys in the preview, as Tab does.
       const jump = async (to: number) => {
         g.pTop = to
+        inPreview = true
         await update($, tick, n => n + 1)
+        void $.ui.focus({ requestId: PANE, key: 'close-preview' }).catch(() => undefined)
       }
+      // The thumb's length is the share of the file in view, its place the share above it; a cell pressed opens the file
+      // that far down.
+      const thumb = Math.max(1, Math.round((previewRoom * previewRoom) / Math.max(1, textRows.length)))
+      const thumbAt = pMax ? Math.round((pTop / pMax) * (previewRoom - thumb)) : 0
+      const cellTo = (i: number) => Math.round((i / Math.max(1, previewRoom - 1)) * pMax)
       // The title button's label gets cols - 8 cells: the title, a space, then "(press to close)" (16), which a narrow
       // box drops before the title would wrap.
       const closeHint = cols - 9 - 16 >= 6
@@ -664,7 +718,7 @@ export const register: Register = on => {
               const indent = ' '.repeat(1 + pad.length + glyph.length)
               const name = r.lines.map((l, i) => (i ? indent + l : l)).join('\n')
               return r.isDir ? (
-                <Button key={rowKey(r.path)} onPress={() => { at = r.path; void update($, cursor, () => r.path); toggle(r.path) }}>
+                <Button key={rowKey(r.path)} onPress={() => { pick(r.path); toggle(r.path) }}>
                   <Text dimColor>{here ? '›' : ' '}{pad}</Text>
                   <Text color="cyan" weight="bold" underline={here}>
                     {glyph}
@@ -672,7 +726,7 @@ export const register: Register = on => {
                   </Text>
                 </Button>
               ) : (
-                <Button key={rowKey(r.path)} onPress={() => { at = r.path; void update($, cursor, () => r.path); void update($, selected, () => r.path) }}>
+                <Button key={rowKey(r.path)} onPress={() => { pick(r.path); void update($, selected, () => r.path) }}>
                   <Text dimColor>{here ? '›' : ' '}{pad}</Text>
                   <Text
                     color={r.path === chosen ? 'white' : TINT[ext(r.name)]}
@@ -745,6 +799,14 @@ export const register: Register = on => {
                       ),
                     )}
                   </Box>
+                  {bar && (
+                    <Box flexDirection="column" width={1}>
+                      {Array.from({ length: previewRoom }, (_, i) => {
+                        const lit = i >= thumbAt && i < thumbAt + thumb
+                        return <Button key={`sb-${i}`} plain label={lit ? '█' : '│'} dimColor={!lit} onPress={() => void jump(cellTo(i))} />
+                      })}
+                    </Box>
+                  )}
                 </Box>
               )}
               {footer && (
