@@ -1458,3 +1458,83 @@ describe('round 6', () => {
     expect((await read()).at).toBe(21)
   })
 })
+
+// Re-audit of f50ddb7: the first two tests name bugs still there; the last two are coverage (they pass).
+describe('round 6', () => {
+  const runsOf = (box: El | undefined) => {
+    const row = box ? all(box).find(e => e.type === 'Box' && e.props?.flexDirection === 'row' && !all(e).some(k => k.props?.key === 'jump-top')) : undefined
+    const kids = (row?.children ?? []).filter(isEl)
+    return (kids[kids.length - 1]?.children ?? []).filter(isEl).map(r => [r.type === 'Code' ? 'code' : r.props?.dimColor ? 'comment' : 'plain', (r.type === 'Code' ? String(r.props?.source ?? '') : textOf(r)).split('\n').length])
+  }
+  const BIG = ('y'.repeat(63) + '\n').repeat(65536) + 'z'
+
+  test('a division after ++ is not read as a regex that resyncs inside a string', async ($, on) => {
+    // The skip runs from "/ 2" to the "/" inside 'a/b', then reads the string's "/*" as a comment that never closes.
+    install(on, { 'd.ts': file("x = a++ / 2; s = 'a/b /* not'\nexport const a = 1\nexport const b = 2") })
+    const { ui, read } = await open($, 80, 30)
+    await ui.press({ key: K('d.ts') })
+    expect(runsOf((await read()).box)).toEqual([['code', 3]])
+  })
+
+  test('the "· cut" title mark fits the box at 14 and 15 columns', { timeoutMs: 30000 }, async ($, on) => {
+    // With no footer under 20 columns the mark goes on the title, but the name is only shrunk to 1 cell:
+    // "[ … · cut ]" plus the trailing space is 12 cells against an inner width of 10 and 11.
+    install(on, { 'over.txt': file(BIG) })
+    const bad: string[] = []
+    for (const cols of [14, 15, 16, 20]) {
+      const { ui, read } = await open($, cols, 400)
+      await ui.press({ key: K('over.txt') })
+      await ui.redraw(props(cols, 20))
+      const v = await read()
+      const label = String(all(v.box ?? v.top).find(e => e.props?.key === 'close-preview')?.props?.label ?? textOf(all(v.box ?? v.top).find(e => e.props?.key === 'close-preview')))
+      if (width(label) + 4 > cols - 4) bad.push(`cols ${cols}: ${JSON.stringify(label)} is ${width(label) + 4} cells, room ${cols - 4}`)
+      await ui.unmount()
+    }
+    expect(bad).toEqual([])
+  })
+
+  test('soft-wrapped previews keep the body bodyRows + 1 tall and every row inside the column', { timeoutMs: 120000 }, async ($, on) => {
+    const src = [
+      '/* a block comment that runs long enough to wrap onto a second and a third row of the box',
+      '   and goes on */',
+      "export const s = 'a string literal that is long enough to wrap across rows, with // and /* inside'",
+      '    const 漢字 = "全角文字列全角文字列全角文字列全角文字列全角文字列全角文字列全角文字列"',
+      ' '.repeat(90),
+      'const t = `template ' + 'x'.repeat(120) + '`',
+    ].join('\n')
+    install(on, { 'w.ts': file(src), ...Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`f${i}.txt`, file()])) })
+    const bad: string[] = []
+    for (const cols of [14, 16, 20, 28, 40, 56]) {
+      const { ui, read } = await open($, cols, 400)
+      await ui.press({ key: K('w.ts') })
+      for (let rows = 4; rows <= 40; rows++) {
+        await ui.redraw(props(cols, rows))
+        const v = await read()
+        if (height(v.top) !== rows + 1) bad.push(`${cols}x${rows}: height ${height(v.top)}`)
+        const col = v.box ? all(v.box).find(e => e.type === 'Box' && typeof e.props?.width === 'number') : undefined
+        const w = Number(col?.props?.width ?? 0)
+        for (const k of (col?.children ?? []).filter(isEl))
+          for (const l of (k.type === 'Code' ? String(k.props?.source ?? '') : textOf(k)).split('\n')) if (width(l) > w) bad.push(`${cols}x${rows}: row ${width(l)} > ${w}`)
+      }
+      await ui.unmount()
+    }
+    expect(bad).toEqual([])
+  })
+
+  test('a 4 MiB log lays out again within a second at each new width', { timeoutMs: 60000 }, async ($, on) => {
+    install(on, { 'big.log': file(BIG) })
+    const { ui, read } = await open($, 60, 30)
+    let t = Date.now()
+    await ui.press({ key: K('big.log') })
+    await read()
+    const times = [Date.now() - t]
+    for (const cols of [61, 62, 63, 64, 65]) {
+      t = Date.now()
+      await ui.redraw(props(cols, 30))
+      await read()
+      times.push(Date.now() - t)
+    }
+    console.log(`4 MiB log: open then 5 widths, ms ${times.join(' ')}`)
+    expect(Math.max(...times)).toBeLessThan(1000)
+  })
+})
