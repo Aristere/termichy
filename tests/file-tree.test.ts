@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { FsEntry, On } from 'claude-code'
 
@@ -792,7 +792,7 @@ describe('sizes', () => {
 })
 
 describe('hooks', () => {
-  test('session.start registers /tree, opens the pane and names the keys in the status', async ($, on) => {
+  test('session.start registers /tree and leaves the pane closed until it is run', async ($, on) => {
     const seen: { command?: string; opened: string[]; status: string[] } = { opened: [], status: [] }
     on('command.register', async (_$, e) => {
       seen.command = e.name
@@ -810,11 +810,12 @@ describe('hooks', () => {
     on('session.start', async (_$, e) => ({ cwd: e.cwd }))
     await $.session.start({ cwd: '/tmp/x', surface: 'terminal', isInteractive: true })
     expect(seen.command).toBe('tree')
-    expect(seen.opened).toContain(PANE)
-    expect(seen.status.join(' ')).toContain('ctrl+x Tab')
+    expect(seen.opened).toEqual([])
+    expect(seen.status.join(' ')).toContain('/tree')
   })
 
   test('/tree opens the pane and answers', async ($, on) => {
+    mock.store(on)
     const opened: string[] = []
     on('ui.open', async (_$, e) => {
       opened.push(e.id)
@@ -826,8 +827,33 @@ describe('hooks', () => {
       origin: { kind: 'composer' },
       presentation: { isFullscreen: true, columns: 120 },
     })
-    expect(r.text).toBe('File tree opened.')
+    // Nothing is saved yet: the pane opens on the defaults with a one-time tip.
+    expect(r.text).toBe('File tree opened. Tip: /tree setup lets you change its width and when it opens.')
     expect(opened).toEqual([PANE])
+  })
+
+  test('/tree takes a width, clamps it, and ignores junk', async ($, on) => {
+    mock.store(on)
+    const widths: (number | undefined)[] = []
+    on('ui.open', async (_$, e) => {
+      widths.push(e.columns)
+      return { value: { isPlaced: true } }
+    })
+    for (const args of ['80', '5', '999', 'wide', ' 70 ', '']) {
+      await $.command.run({ command: 'tree', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
+    }
+    expect(widths).toEqual([80, 30, 120, 56, 70, 56])
+  })
+
+  test('the tip about /tree setup shows once, and a dismissed setup saves nothing', async ($, on) => {
+    mock.store(on)
+    on('ui.open', async () => ({ value: { isPlaced: true } }))
+    const run = (args: string) =>
+      $.command.run({ command: 'tree', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
+    expect((await run('')).text).toContain('Tip: /tree setup')
+    expect((await run('')).text).toBe('File tree opened.')
+    // No one answers the questions here, so they come back dismissed.
+    expect((await run('setup')).text).toBe('File tree opened. Setup skipped.')
   })
 
   test('ui.scroll for another pane is not taken', async ($, on) => {
@@ -998,6 +1024,7 @@ describe('e2e', () => {
   })
 
   test('/tree asks the dock for a width', async ($, on) => {
+    mock.store(on)
     const asked: (number | undefined)[] = []
     on('ui.open', async (_$, e) => {
       asked.push(e.columns)

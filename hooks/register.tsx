@@ -4,6 +4,8 @@ import type { Register } from 'claude-code'
 const PANE = 'file-tree'
 // The dock width asked for; one the person dragged wins, and without a request the dock can leave the chat a sliver.
 const DOCK_COLUMNS = 56
+const MIN_COLUMNS = 30
+const MAX_COLUMNS = 120
 const SKIP = new Set(['.git', 'node_modules', '.DS_Store'])
 const expanded = atom({ plugin: 'file-tree', key: 'expanded' } as const, [] as string[])
 const tick = atom({ plugin: 'file-tree', key: 'tick' } as const, 0)
@@ -386,18 +388,70 @@ const focusCursor = ($: any) => {
     .catch(() => undefined)
 }
 
+// The person's userConfig values. The `/config` rows are not listed yet during session.start, so the saved settings
+// answer there; junk or a failed read falls back to the defaults. `asked` is true once either value was ever saved.
+type Reader = {
+  config: { list: () => Promise<{ key: string; value: unknown }[]> }
+  settings: { read: () => Promise<{ pluginConfigs?: Record<string, { options?: Record<string, unknown> }> }> }
+}
+const settings = async ($: Reader) => {
+  const rows = await $.config.list().catch(() => [])
+  const saved = await $.settings.read().then(x => x.pluginConfigs ?? {}, () => ({}))
+  const key = Object.keys(saved).find(k => k === 'file-tree' || k.startsWith('file-tree@'))
+  const own = key ? saved[key]?.options : undefined
+  const value = (name: string) => rows.find(r => r.key === `file-tree.${name}`)?.value ?? own?.[name]
+  const width = Number(value('width'))
+  return {
+    width: Number.isFinite(width) && width > 0 ? Math.min(MAX_COLUMNS, Math.max(MIN_COLUMNS, Math.round(width))) : DOCK_COLUMNS,
+    openOnStart: value('openOnStart') === true,
+    asked: own?.width !== undefined || own?.openOnStart !== undefined,
+  }
+}
+
+// `/tree setup` asks in plain words; the numbers behind the names stay out of sight.
+const WIDTHS = { Slim: 40, Balanced: 56, Roomy: 80 } as const
+const AUTO = 'Open it automatically'
+const MANUAL = 'Only when I ask (/tree)'
+type Asker = Reader & {
+  ui: { ask: (q: string, o: { options: readonly string[]; header: string }) => Promise<string> }
+  config: { set: (a: { key: string; value: string | number | boolean }) => Promise<{ deny?: string }> }
+}
+const setup = async ($: Asker) => {
+  const wide = await $.ui.ask('How wide should the file tree be?', { options: Object.keys(WIDTHS), header: 'Width' })
+  const auto = await $.ui.ask('When should the file tree open?', { options: [AUTO, MANUAL], header: 'Opening' })
+  const columns = WIDTHS[wide as keyof typeof WIDTHS]
+  // "Other" free text matches no label and keeps the current value.
+  const writes = [...(columns ? [{ key: 'file-tree.width', value: columns }] : []), ...(auto === AUTO || auto === MANUAL ? [{ key: 'file-tree.openOnStart', value: auto === AUTO }] : [])]
+  for (const w of writes) if ((await $.config.set(w)).deny) return false
+  return true
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'tree', description: 'Show the project file tree in a pane' })
-    void $.ui.open({ id: PANE, title: 'Files', columns: DOCK_COLUMNS })
+    await $.command.register({ name: 'tree', description: 'Show the project file tree in a pane', argumentHint: '[setup]' })
+    const { width, openOnStart } = await settings($)
+    // Closed until the person runs /tree, unless they chose to have it open at the start.
+    if (openOnStart) void $.ui.open({ id: PANE, title: 'Files', columns: width })
     // The pane takes the keys only through ctrl+x Tab; naming it where the prompt is makes it findable.
-    $.ui.status('files: ctrl+x Tab to enter, Esc to return')
+    $.ui.status(openOnStart ? 'files: ctrl+x Tab to enter, Esc to return' : 'files: type /tree to open')
     return next(e)
   })
 
-  on('command.run', { command: 'tree' }, async $ => {
-    await $.ui.open({ id: PANE, title: 'Files', columns: DOCK_COLUMNS })
-    return { text: 'File tree opened.' }
+  on('command.run', { command: 'tree' }, async ($, e) => {
+    const arg = e.args.trim()
+    let note = ''
+    if (arg === 'setup') {
+      // A dismissed question rejects; nothing is saved then.
+      note = await setup($).then(ok => (ok ? 'Saved.' : 'Could not save the choices.'), () => 'Setup skipped.')
+    } else if (!(await settings($)).asked && !(await $.store.get('tipShown'))) {
+      // It works on the defaults; the tip is shown once.
+      note = 'Tip: /tree setup lets you change its width and when it opens.'
+      await $.store.set('tipShown', true)
+    }
+    const asked = Number.parseInt(arg, 10)
+    const columns = Number.isFinite(asked) ? Math.min(MAX_COLUMNS, Math.max(MIN_COLUMNS, asked)) : (await settings($)).width
+    await $.ui.open({ id: PANE, title: 'Files', columns })
+    return { text: note ? `File tree opened. ${note}` : 'File tree opened.' }
   })
 
   // The engine scrolls a focused pane with the arrows; taking the move here lets them walk the rows instead.

@@ -2,5 +2,21 @@
   "name": "file-tree",
   "version": "0.1.0",
   "description": "A project file tree pane inside Claude Code, the same in every terminal.",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "width": {
+      "type": "number",
+      "title": "Pane width",
+      "description": "Columns the pane asks the dock for",
+      "default": 56,
+      "min": 30,
+      "max": 120
+    },
+    "openOnStart": {
+      "type": "boolean",
+      "title": "Open on session start",
+      "description": "Show the file tree when a session starts",
+      "default": false
+    }
+  }
 }
