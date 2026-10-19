@@ -47,7 +47,7 @@ Your answers are kept for every session and project. The pane closes and reopens
 
 ## Data
 
-The plugin makes no network requests and sends nothing anywhere. It reads files under the folder you opened to draw the tree and the preview, and it runs `sips` (images, macOS only), `head` (large text files) and `open`, `xdg-open` or `explorer` (the open and reveal buttons) on your machine. It never writes to your project.
+The plugin makes no network requests and sends nothing anywhere. It reads files under the folder you opened to draw the tree and the preview, and it runs `sips` (images, macOS only), `mktemp` and `rm` (a temporary folder for the image preview, deleted right after), `head` (large text files) and `open`, `xdg-open` or `explorer` (the open and reveal buttons) on your machine. It never writes to your project.
 
 What it hooks and sets:
 
