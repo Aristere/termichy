@@ -443,6 +443,8 @@ export const register: Register = on => {
         let ok = true
         if (pick.columns !== undefined) ok = !(await $.config.set({ key: 'file-tree.width', value: pick.columns })).deny
         if (ok && pick.open !== undefined) ok = !(await $.config.set({ key: 'file-tree.openOnStart', value: pick.open })).deny
+        // An open pane keeps its size; closing first makes the open below take the saved width.
+        if (ok) await $.ui.close({ id: PANE })
         note = ok ? 'Saved.' : 'Could not save the choices.'
       } catch {
         note = 'Setup skipped.'
