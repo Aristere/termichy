@@ -43,7 +43,7 @@ The defaults work, so setup is optional. Run `/tree setup` to answer two questio
 - **How wide should the file tree be?** Slim, Balanced or Roomy.
 - **When should the file tree open?** Automatically when a session starts, or only when you type `/tree`.
 
-Your answers are kept for every session and project. Run `/tree setup` again to change them. The same two settings are in `/config`, under "Pane width" and "Open on session start".
+Your answers are kept for every session and project. The pane closes and reopens so the new width applies right away. Run `/tree setup` again to change them. The same two settings are in `/config`, under "Pane width" and "Open on session start".
 
 ## Data
 
