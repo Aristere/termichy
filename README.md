@@ -4,7 +4,7 @@ A file tree and file preview inside Claude Code. Type `/tree`, browse your proje
 
 ![MIT license](https://img.shields.io/badge/license-MIT-blue) ![Claude Code 2.1.302+](https://img.shields.io/badge/Claude%20Code-2.1.302%2B-orange)
 
-![file-tree demo: open the pane, expand a folder, preview a file, scroll it, then run setup](assets/demo.gif)
+![file-tree demo: open the pane, preview a file, then watch new files appear in the tree as Claude writes them](assets/demo.gif)
 
 ## Install
 
